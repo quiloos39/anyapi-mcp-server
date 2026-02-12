@@ -16,7 +16,9 @@ Instead of building a custom MCP server for every API, `anyapi-mcp-server` reads
 - **Retry with backoff** — automatic retries with exponential backoff and jitter for 429/5xx errors, honoring `Retry-After` headers
 - **Multi-format responses** — parses JSON, XML, CSV, and plain text responses automatically
 - **Built-in pagination** — API-level pagination via `params`; client-side slicing with top-level `limit`/`offset`
-- **Per-request headers** — override default headers on individual `call_api`/`query_api` calls
+- **Spec documentation lookup** — `explain_api` returns rich endpoint docs (parameters, response codes, deprecation, request body schema) without making HTTP requests
+- **Concurrent batch queries** — `batch_query` fetches data from up to 10 endpoints in parallel, returning all results in one tool call
+- **Per-request headers** — override default headers on individual `call_api`/`query_api`/`batch_query` calls
 - **Environment variable interpolation** — use `${ENV_VAR}` in base URLs and headers
 - **Request logging** — optional NDJSON request/response log with sensitive header masking
 
@@ -126,7 +128,7 @@ Add to your MCP configuration (e.g. `~/.cursor/mcp.json` or Claude Desktop confi
 
 ## Tools
 
-The server exposes three MCP tools:
+The server exposes five MCP tools:
 
 ### `list_api`
 
@@ -206,11 +208,33 @@ Fetch data from an API endpoint, returning only the fields you select via GraphQ
 - For API-level pagination, pass limit/offset inside `params` instead
 - Accepts optional `headers` to override defaults for this request
 
+### `explain_api`
+
+Get detailed documentation for an endpoint directly from the spec — no HTTP request is made.
+
+- Returns summary, description, operationId, deprecation status, tag
+- Lists all parameters with name, location (`path`/`query`/`header`), required flag, and description
+- Shows request body schema with property types, required fields, and descriptions
+- Lists response status codes with descriptions (e.g. `200 OK`, `404 Not Found`)
+- Includes external docs link when available
+
+### `batch_query`
+
+Fetch data from multiple endpoints concurrently in a single tool call.
+
+- Accepts an array of 1–10 requests, each with `method`, `path`, `params`, `body`, `query`, and optional `headers`
+- All requests execute in parallel via `Promise.allSettled` — one failure does not affect the others
+- Each request follows the `query_api` flow: HTTP fetch → schema inference → GraphQL field selection
+- Returns an array of results: `{ method, path, data }` on success or `{ method, path, error }` on failure
+- Run `call_api` first on each endpoint to discover the schema field names
+
 ## Workflow
 
 1. **Discover** endpoints with `list_api`
-2. **Inspect** a specific endpoint with `call_api` to see its schema and suggested queries
-3. **Query** the endpoint with `query_api` to fetch exactly the fields you need
+2. **Understand** an endpoint with `explain_api` to see its parameters, request body, and response codes
+3. **Inspect** a specific endpoint with `call_api` to see the inferred response schema and suggested queries
+4. **Query** the endpoint with `query_api` to fetch exactly the fields you need
+5. **Batch** multiple queries with `batch_query` when you need data from several endpoints at once
 
 ## How It Works
 
@@ -218,20 +242,21 @@ Fetch data from an API endpoint, returning only the fields you select via GraphQ
 OpenAPI/Postman spec
         │
         ▼
-   ┌─────────┐     ┌──────────┐     ┌────────────┐
-   │ list_api │     │ call_api │────▶│ query_api  │
-   │ (browse) │     │ (schema) │     │ (data)     │
-   └─────────┘     └──────────┘     └────────────┘
-                        │                 │
-                        ▼                 ▼
-                   REST API call     REST API call
-                   (with retry       (cached if same
-                    + caching)        as call_api)
-                        │                 │
-                        ▼                 ▼
-                   Infer GraphQL     Execute GraphQL
-                   schema from       query against
-                   JSON response     response data
+   ┌─────────┐  ┌─────────────┐  ┌──────────┐  ┌───────────┐  ┌─────────────┐
+   │list_api │  │ explain_api │  │ call_api │  │ query_api │  │ batch_query │
+   │(browse) │  │   (docs)    │  │ (schema) │  │  (data)   │  │ (parallel)  │
+   └─────────┘  └─────────────┘  └──────────┘  └───────────┘  └─────────────┘
+        │          │ no HTTP          │               │             │
+        ▼          ▼ request          ▼               ▼             ▼
+   Spec index   Spec index     REST API call    REST API call  N concurrent
+   (tags,       (params,       (with retry      (cached if     REST API calls
+    paths)       responses,     + caching)       same as        + GraphQL
+                 body schema)       │            call_api)      execution
+                                    ▼               │
+                               Infer GraphQL        ▼
+                               schema from     Execute GraphQL
+                               JSON response   query against
+                                               response data
 ```
 
 1. The spec file is parsed at startup into an endpoint index with tags, paths, parameters, and request body schemas
