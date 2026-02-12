@@ -1,0 +1,328 @@
+#!/usr/bin/env node
+
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { loadConfig } from "./config.js";
+import { ApiIndex } from "./api-index.js";
+import { callApi } from "./api-client.js";
+import { initLogger } from "./logger.js";
+import { generateSuggestions } from "./query-suggestions.js";
+import {
+  getOrBuildSchema,
+  executeQuery,
+  schemaToSDL,
+  truncateIfArray,
+} from "./graphql-schema.js";
+
+const config = loadConfig();
+initLogger(config.logPath ?? null);
+const apiIndex = new ApiIndex(config.spec);
+
+const server = new McpServer({
+  name: config.name,
+  version: "1.1.4",
+});
+
+// --- Tool 1: list_api ---
+server.tool(
+  "list_api",
+  `List available ${config.name} API endpoints. ` +
+    "Call with no arguments to see all categories. " +
+    "Provide 'category' to list endpoints in a tag. " +
+    "Provide 'search' to search across paths and descriptions. " +
+    "The correct query format is auto-selected based on mode. " +
+    "You can optionally override with a custom 'query' parameter. " +
+    "Results are paginated with limit (default 20) and offset.",
+  {
+    category: z
+      .string()
+      .optional()
+      .describe("Tag/category to filter by. Omit to see all categories."),
+    search: z
+      .string()
+      .optional()
+      .describe("Search keyword across endpoint paths and descriptions"),
+    query: z
+      .string()
+      .optional()
+      .describe(
+        "Optional GraphQL selection query override. If omitted, a sensible default is used automatically:\n" +
+          "Categories (no args): '{ items { tag endpointCount } _count }'\n" +
+          "Endpoints (with category/search): '{ items { method path summary tag parameters { name in required description } } _count }'"
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("Max items to return (default: 20)"),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Items to skip (default: 0)"),
+  },
+  async ({ category, search, query, limit, offset }) => {
+    try {
+      const isEndpointMode = !!(search || category);
+      let data: unknown[];
+      if (search) {
+        data = apiIndex.searchAll(search);
+      } else if (category) {
+        data = apiIndex.listAllByCategory(category);
+      } else {
+        data = apiIndex.listAllCategories();
+      }
+
+      const defaultQuery = isEndpointMode
+        ? "{ items { method path summary tag parameters { name in required description } } _count }"
+        : "{ items { tag endpointCount } _count }";
+      const effectiveQuery = query ?? defaultQuery;
+
+      const schema = getOrBuildSchema(data, "LIST", category ?? search ?? "_categories");
+      const { data: sliced, truncated, total } = truncateIfArray(data, limit ?? 20, offset);
+      const queryResult = await executeQuery(schema, sliced, effectiveQuery);
+
+      if (truncated && typeof queryResult === "object" && queryResult !== null) {
+        (queryResult as Record<string, unknown>)._meta = {
+          total,
+          offset: offset ?? 0,
+          limit: limit ?? 20,
+          hasMore: true,
+        };
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(queryResult, null, 2) },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify({ error: message }) },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Tool 2: call_api ---
+server.tool(
+  "call_api",
+  `Inspect a ${config.name} API endpoint. Makes a real request and returns ONLY the ` +
+    "inferred GraphQL schema (SDL) showing all available fields and their types. " +
+    "No response data is returned — use query_api to fetch actual data. " +
+    "IMPORTANT: Read the returned schema carefully. The root field names in the schema " +
+    "are what you must use in query_api — do NOT assume generic names like 'items'. " +
+    "For example, if the schema shows 'products: [Product]', query as '{ products { id name } }', not '{ items { id name } }'. " +
+    "Also returns accepted parameters (name, location, required) from the API spec, " +
+    "and suggestedQueries with ready-to-use GraphQL queries. " +
+    "Use list_api first to discover endpoints.",
+  {
+    method: z
+      .enum(["GET", "POST", "PUT", "DELETE", "PATCH"])
+      .describe("HTTP method"),
+    path: z
+      .string()
+      .describe(
+        "API path template (e.g. '/api/card/{id}'). Use list_api to discover paths."
+      ),
+    params: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Path and query parameters as key-value pairs. " +
+          "Path params like {id} are interpolated; remaining become query string for GET."
+      ),
+    body: z
+      .record(z.unknown())
+      .optional()
+      .describe("Request body for POST/PUT/PATCH"),
+    headers: z
+      .record(z.string())
+      .optional()
+      .describe(
+        "Additional HTTP headers for this request (e.g. { \"Authorization\": \"Bearer <token>\" }). " +
+          "Overrides default --header values."
+      ),
+  },
+  async ({ method, path, params, body, headers }) => {
+    try {
+      const data = await callApi(
+        config,
+        method,
+        path,
+        params as Record<string, unknown> | undefined,
+        body as Record<string, unknown> | undefined,
+        headers,
+        "populate"
+      );
+
+      const endpoint = apiIndex.getEndpoint(method, path);
+      const schema = getOrBuildSchema(data, method, path, endpoint?.requestBodySchema);
+      const sdl = schemaToSDL(schema);
+
+      const result: Record<string, unknown> = { graphqlSchema: sdl };
+
+      if (endpoint && endpoint.parameters.length > 0) {
+        result.parameters = endpoint.parameters.map((p) => ({
+          name: p.name,
+          in: p.in,
+          required: p.required,
+          ...(p.description ? { description: p.description } : {}),
+        }));
+      }
+
+      // Smart query suggestions
+      const suggestions = generateSuggestions(schema);
+      if (suggestions.length > 0) {
+        result.suggestedQueries = suggestions;
+      }
+
+      if (Array.isArray(data)) {
+        result.totalItems = data.length;
+        result.hint =
+          "Use query_api with field names from the schema above. " +
+          "For raw arrays: '{ items { ... } _count }'. " +
+          "For paginated APIs, pass limit/offset inside params (as query string parameters to the API), " +
+          "NOT as top-level tool parameters.";
+      } else {
+        result.hint =
+          "Use query_api with the exact root field names from the schema above (e.g. if schema shows " +
+          "'products: [Product]', query as '{ products { id name } }' — do NOT use '{ items { ... } }'). " +
+          "For paginated APIs, pass limit/offset inside params (as query string parameters to the API), " +
+          "NOT as top-level tool parameters.";
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify({ error: message }) },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Tool 3: query_api ---
+server.tool(
+  "query_api",
+  `Fetch data from a ${config.name} API endpoint, returning only the fields you select via GraphQL. ` +
+    "IMPORTANT: Always run call_api first to discover the actual schema field names. " +
+    "Use the exact root field names from the schema — do NOT assume generic names.\n" +
+    "- Raw array response ([...]): '{ items { id name } _count }'\n" +
+    "- Object response ({products: [...]}): '{ products { id name } }' (use actual field names from schema)\n" +
+    "- Write operations with mutation schema: 'mutation { post_endpoint(input: { ... }) { id name } }'\n" +
+    "Field names with dashes are converted to underscores (e.g. created-at → created_at). " +
+    "PAGINATION: To paginate the API itself, pass limit/offset inside 'params' (they become query string parameters). " +
+    "The top-level limit/offset parameters only slice the already-fetched response locally.",
+  {
+    method: z
+      .enum(["GET", "POST", "PUT", "DELETE", "PATCH"])
+      .describe("HTTP method"),
+    path: z
+      .string()
+      .describe("API path template (e.g. '/api/card/{id}')"),
+    params: z
+      .record(z.unknown())
+      .optional()
+      .describe(
+        "Path and query parameters. Path params like {id} are interpolated; " +
+          "remaining become query string for GET. " +
+          "For API pagination, pass limit/offset here (e.g. { limit: 20, offset: 40 })."
+      ),
+    body: z
+      .record(z.unknown())
+      .optional()
+      .describe("Request body for POST/PUT/PATCH"),
+    query: z
+      .string()
+      .describe(
+        "GraphQL selection query using field names from call_api schema " +
+          "(e.g. '{ products { id name } }' — NOT '{ items { ... } }' unless the API returns a raw array)"
+      ),
+    headers: z
+      .record(z.string())
+      .optional()
+      .describe(
+        "Additional HTTP headers for this request (e.g. { \"Authorization\": \"Bearer <token>\" }). " +
+          "Overrides default --header values."
+      ),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe("Client-side slice: max items from already-fetched response (default: 50). For API pagination, use params instead."),
+    offset: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Client-side slice: items to skip in already-fetched response (default: 0). For API pagination, use params instead."),
+  },
+  async ({ method, path, params, body, query, headers, limit, offset }) => {
+    try {
+      const rawData = await callApi(
+        config,
+        method,
+        path,
+        params as Record<string, unknown> | undefined,
+        body as Record<string, unknown> | undefined,
+        headers,
+        "consume"
+      );
+
+      const endpoint = apiIndex.getEndpoint(method, path);
+      const schema = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema);
+      const { data, truncated, total } = truncateIfArray(rawData, limit, offset);
+      const queryResult = await executeQuery(schema, data, query);
+
+      if (truncated && typeof queryResult === "object" && queryResult !== null) {
+        (queryResult as Record<string, unknown>)._meta = {
+          total,
+          offset: offset ?? 0,
+          limit: limit ?? 50,
+          hasMore: true,
+        };
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(queryResult, null, 2) },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify({ error: message }) },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(`${config.name} MCP Server running on stdio`);
+}
+
+main().catch((error) => {
+  console.error("Fatal error:", error);
+  process.exit(1);
+});
