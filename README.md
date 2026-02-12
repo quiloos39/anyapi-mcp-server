@@ -4,9 +4,11 @@
 
 <img src="public/datadog.gif" alt="anyapi-mcp-server demo — Datadog API" width="1200" />
 
-A universal [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that connects **any REST API** to AI assistants like Claude, Cursor, and other LLM-powered tools — just point it at an OpenAPI spec or Postman collection.
+Traditional MCP servers hand-pick a handful of endpoints and call it a day — locking you into whatever subset someone decided was "enough." Why settle for a fraction of an API when you can have **all of it**?
 
-Instead of building a custom MCP server for every API, `anyapi-mcp-server` reads your spec file and dynamically creates tools with **GraphQL-style field selection** and automatic schema inference.
+`anyapi-mcp-server` is a universal [MCP](https://modelcontextprotocol.io) server that connects **any REST API** to AI assistants like Claude, Cursor, and other LLM-powered tools — just point it at an OpenAPI spec or Postman collection. Every endpoint the API provides becomes available instantly, with **GraphQL-style field selection** and automatic schema inference. No custom server code, no artificial limits.
+
+Works with services like **Datadog**, **PostHog**, **Metabase**, **Cloudflare**, **Stripe**, **GitHub**, **Slack**, **Twilio**, **Shopify**, **HubSpot**, and anything else with a REST API — if it has an API, it just works.
 
 ## Features
 
