@@ -17,6 +17,11 @@ export interface RequestBodySchema {
   properties: Record<string, RequestBodyProperty>;
 }
 
+export interface ApiResponse {
+  statusCode: string;
+  description: string;
+}
+
 export interface ApiEndpoint {
   method: string;
   path: string;
@@ -26,6 +31,11 @@ export interface ApiEndpoint {
   parameters: ApiParameter[];
   hasRequestBody: boolean;
   requestBodySchema?: RequestBodySchema;
+  operationId?: string;
+  deprecated?: boolean;
+  responses?: ApiResponse[];
+  requestBodyDescription?: string;
+  externalDocs?: { url: string; description?: string };
 }
 
 export interface CategorySummary {

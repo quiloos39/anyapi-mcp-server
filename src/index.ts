@@ -21,7 +21,7 @@ const apiIndex = new ApiIndex(config.spec);
 
 const server = new McpServer({
   name: config.name,
-  version: "1.1.4",
+  version: "1.2.0",
 });
 
 // --- Tool 1: list_api ---
@@ -302,6 +302,198 @@ server.tool(
       return {
         content: [
           { type: "text" as const, text: JSON.stringify(queryResult, null, 2) },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify({ error: message }) },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Tool 4: explain_api ---
+server.tool(
+  "explain_api",
+  `Get detailed documentation for a ${config.name} API endpoint from the spec. ` +
+    "Returns all available spec information — summary, description, parameters, " +
+    "request body schema, response codes, deprecation status — without making any HTTP request. " +
+    "Use list_api first to discover endpoints, then explain_api to understand them before calling.",
+  {
+    method: z
+      .enum(["GET", "POST", "PUT", "DELETE", "PATCH"])
+      .describe("HTTP method"),
+    path: z
+      .string()
+      .describe("API path template (e.g. '/api/card/{id}')"),
+  },
+  async ({ method, path }) => {
+    try {
+      const endpoint = apiIndex.getEndpoint(method, path);
+      if (!endpoint) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Endpoint not found: ${method} ${path}`,
+                hint: "Use list_api to discover available endpoints.",
+              }),
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const result: Record<string, unknown> = {
+        method: endpoint.method,
+        path: endpoint.path,
+        summary: endpoint.summary,
+      };
+
+      if (endpoint.description) {
+        result.description = endpoint.description;
+      }
+      if (endpoint.operationId) {
+        result.operationId = endpoint.operationId;
+      }
+      if (endpoint.deprecated) {
+        result.deprecated = true;
+      }
+      result.tag = endpoint.tag;
+
+      if (endpoint.parameters.length > 0) {
+        result.parameters = endpoint.parameters.map((p) => ({
+          name: p.name,
+          in: p.in,
+          required: p.required,
+          ...(p.description ? { description: p.description } : {}),
+        }));
+      }
+
+      if (endpoint.hasRequestBody) {
+        const bodyInfo: Record<string, unknown> = {};
+        if (endpoint.requestBodyDescription) {
+          bodyInfo.description = endpoint.requestBodyDescription;
+        }
+        if (endpoint.requestBodySchema) {
+          bodyInfo.contentType = endpoint.requestBodySchema.contentType;
+          bodyInfo.properties = endpoint.requestBodySchema.properties;
+        }
+        result.requestBody = bodyInfo;
+      }
+
+      if (endpoint.responses && endpoint.responses.length > 0) {
+        result.responses = endpoint.responses;
+      }
+
+      if (endpoint.externalDocs) {
+        result.externalDocs = endpoint.externalDocs;
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
+      };
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify({ error: message }) },
+        ],
+        isError: true,
+      };
+    }
+  }
+);
+
+// --- Tool 5: batch_query ---
+server.tool(
+  "batch_query",
+  `Fetch data from multiple ${config.name} API endpoints concurrently. ` +
+    "Each request in the batch follows the query_api flow — makes a real HTTP request " +
+    "and returns only the fields selected via GraphQL query. " +
+    "All requests execute in parallel; one failure does not affect the others. " +
+    "IMPORTANT: Run call_api first on each endpoint to discover schema field names.",
+  {
+    requests: z
+      .array(
+        z.object({
+          method: z
+            .enum(["GET", "POST", "PUT", "DELETE", "PATCH"])
+            .describe("HTTP method"),
+          path: z.string().describe("API path template"),
+          params: z
+            .record(z.unknown())
+            .optional()
+            .describe("Path and query parameters"),
+          body: z
+            .record(z.unknown())
+            .optional()
+            .describe("Request body for POST/PUT/PATCH"),
+          query: z
+            .string()
+            .describe("GraphQL selection query (use field names from call_api schema)"),
+          headers: z
+            .record(z.string())
+            .optional()
+            .describe("Additional HTTP headers for this request"),
+        })
+      )
+      .min(1)
+      .max(10)
+      .describe("Array of requests to execute concurrently (1-10)"),
+  },
+  async ({ requests }) => {
+    try {
+      const settled = await Promise.allSettled(
+        requests.map(async (req) => {
+          const rawData = await callApi(
+            config,
+            req.method,
+            req.path,
+            req.params as Record<string, unknown> | undefined,
+            req.body as Record<string, unknown> | undefined,
+            req.headers,
+            "none"
+          );
+
+          const endpoint = apiIndex.getEndpoint(req.method, req.path);
+          const schema = getOrBuildSchema(
+            rawData,
+            req.method,
+            req.path,
+            endpoint?.requestBodySchema
+          );
+          const queryResult = await executeQuery(schema, rawData, req.query);
+
+          return { method: req.method, path: req.path, data: queryResult };
+        })
+      );
+
+      const results = settled.map((outcome, i) => {
+        if (outcome.status === "fulfilled") {
+          return outcome.value;
+        }
+        const message =
+          outcome.reason instanceof Error
+            ? outcome.reason.message
+            : String(outcome.reason);
+        return {
+          method: requests[i].method,
+          path: requests[i].path,
+          error: message,
+        };
+      });
+
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(results, null, 2) },
         ],
       };
     } catch (error: unknown) {

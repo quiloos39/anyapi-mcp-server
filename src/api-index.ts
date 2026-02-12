@@ -3,6 +3,7 @@ import yaml from "js-yaml";
 import type {
   ApiEndpoint,
   ApiParameter,
+  ApiResponse,
   CategorySummary,
   ApiEndpointSummary,
   ListApiResult,
@@ -16,6 +17,9 @@ interface OpenApiOperation {
   summary?: string;
   description?: string;
   tags?: string[];
+  operationId?: string;
+  deprecated?: boolean;
+  externalDocs?: { url?: string; description?: string };
   parameters?: Array<{
     name: string;
     in: string;
@@ -23,6 +27,7 @@ interface OpenApiOperation {
     description?: string;
   }>;
   requestBody?: unknown;
+  responses?: Record<string, { description?: string }>;
 }
 
 interface OpenApiSpec {
@@ -218,6 +223,24 @@ export class ApiIndex {
 
         const requestBodySchema = extractRequestBodySchema(op.requestBody, rawSpec);
 
+        // Extract response descriptions
+        let responses: ApiResponse[] | undefined;
+        if (op.responses) {
+          responses = Object.entries(op.responses).map(([code, resp]) => ({
+            statusCode: code,
+            description: resp.description ?? "",
+          }));
+        }
+
+        // Extract request body description
+        let requestBodyDescription: string | undefined;
+        if (op.requestBody && typeof op.requestBody === "object") {
+          const rb = op.requestBody as Record<string, unknown>;
+          if (typeof rb.description === "string") {
+            requestBodyDescription = rb.description;
+          }
+        }
+
         const endpoint: ApiEndpoint = {
           method: method.toUpperCase(),
           path,
@@ -227,6 +250,13 @@ export class ApiIndex {
           parameters,
           hasRequestBody: !!op.requestBody,
           requestBodySchema,
+          operationId: op.operationId,
+          deprecated: op.deprecated ?? undefined,
+          responses,
+          requestBodyDescription,
+          externalDocs: op.externalDocs?.url
+            ? { url: op.externalDocs.url, description: op.externalDocs.description }
+            : undefined,
         };
 
         this.addEndpoint(endpoint);
