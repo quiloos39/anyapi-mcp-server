@@ -76,6 +76,15 @@ server.tool(
         data = apiIndex.listAllCategories();
       }
 
+      // Empty results — return directly to avoid GraphQL schema errors on empty arrays
+      if (data.length === 0) {
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ items: [], _count: 0 }, null, 2) },
+          ],
+        };
+      }
+
       const defaultQuery = isEndpointMode
         ? "{ items { method path summary tag parameters { name in required description } } _count }"
         : "{ items { tag endpointCount } _count }";

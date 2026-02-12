@@ -2,6 +2,7 @@ import {
   GraphQLSchema,
   GraphQLObjectType,
   GraphQLInputObjectType,
+  GraphQLScalarType,
   GraphQLString,
   GraphQLInt,
   GraphQLFloat,
@@ -17,7 +18,19 @@ import type { GraphQLFieldConfigMap, GraphQLInputFieldConfigMap } from "graphql"
 import type { RequestBodySchema } from "./types.js";
 
 const DEFAULT_ARRAY_LIMIT = 50;
-const MAX_SAMPLE_SIZE = 10;
+const MAX_SAMPLE_SIZE = 30;
+const MAX_INFER_DEPTH = 4;
+
+/**
+ * Custom scalar that passes arbitrary JSON values through as-is.
+ * Used for mixed-type arrays, type-conflicting fields, and deeply nested structures.
+ */
+const GraphQLJSON = new GraphQLScalarType({
+  name: "JSON",
+  description: "Arbitrary JSON value (mixed types, deep nesting, or heterogeneous structures)",
+  serialize: (value) => value,
+  parseValue: (value) => value,
+});
 
 // Schema cache keyed by "METHOD:/path/template"
 const schemaCache = new Map<string, GraphQLSchema>();
@@ -74,6 +87,29 @@ function deriveTypeName(method: string, pathTemplate: string): string {
   return name || "Unknown";
 }
 
+/**
+ * Return the base type category of a value for mixed-type detection.
+ */
+function baseTypeOf(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value; // "string" | "number" | "boolean" | "object"
+}
+
+/**
+ * Check if an array has mixed base types (e.g. string + number, or scalar + object).
+ * Returns true if the array should be treated as JSON scalar.
+ */
+function hasMixedTypes(arr: unknown[]): boolean {
+  const types = new Set<string>();
+  const sampleSize = Math.min(arr.length, MAX_SAMPLE_SIZE);
+  for (let i = 0; i < sampleSize; i++) {
+    const t = baseTypeOf(arr[i]);
+    if (t !== "null") types.add(t);
+  }
+  return types.size > 1;
+}
+
 function inferScalarType(value: unknown): GraphQLOutputType {
   switch (typeof value) {
     case "string":
@@ -87,41 +123,66 @@ function inferScalarType(value: unknown): GraphQLOutputType {
   }
 }
 
+/** Result of merging samples: the merged object + any fields with type conflicts. */
+interface MergeResult {
+  merged: Record<string, unknown>;
+  conflicts: Set<string>;
+}
+
 /**
  * Merge multiple sample objects into a single "super-object" that contains
  * every key seen across all samples. First non-null value wins for each key.
  * Nested objects are merged recursively.
+ * Tracks fields where different samples have conflicting base types.
  */
-function mergeSamples(items: Record<string, unknown>[]): Record<string, unknown> {
+function mergeSamples(items: Record<string, unknown>[]): MergeResult {
   const merged: Record<string, unknown> = {};
+  const conflicts = new Set<string>();
+  const seenTypes = new Map<string, string>(); // key → first base type
 
   for (const item of items) {
     for (const [key, value] of Object.entries(item)) {
+      if (value === null || value === undefined) continue;
+
+      const valueType = baseTypeOf(value);
+
       if (!(key in merged) || merged[key] === null || merged[key] === undefined) {
         merged[key] = value;
-      } else if (
-        typeof value === "object" && value !== null && !Array.isArray(value) &&
-        typeof merged[key] === "object" && merged[key] !== null && !Array.isArray(merged[key])
-      ) {
-        merged[key] = mergeSamples([
-          merged[key] as Record<string, unknown>,
-          value as Record<string, unknown>,
-        ]);
-      } else if (Array.isArray(value) && Array.isArray(merged[key])) {
-        if ((merged[key] as unknown[]).length === 0 && value.length > 0) {
-          merged[key] = value;
+        if (!seenTypes.has(key)) seenTypes.set(key, valueType);
+      } else {
+        const prevType = seenTypes.get(key);
+        if (prevType && prevType !== valueType) {
+          conflicts.add(key);
+        }
+
+        if (
+          !conflicts.has(key) &&
+          typeof value === "object" && value !== null && !Array.isArray(value) &&
+          typeof merged[key] === "object" && merged[key] !== null && !Array.isArray(merged[key])
+        ) {
+          const sub = mergeSamples([
+            merged[key] as Record<string, unknown>,
+            value as Record<string, unknown>,
+          ]);
+          merged[key] = sub.merged;
+          for (const c of sub.conflicts) conflicts.add(`${key}.${c}`);
+        } else if (Array.isArray(value) && Array.isArray(merged[key])) {
+          if ((merged[key] as unknown[]).length === 0 && value.length > 0) {
+            merged[key] = value;
+          }
         }
       }
     }
   }
 
-  return merged;
+  return { merged, conflicts };
 }
 
 /**
  * Sample and merge multiple array elements for richer type inference.
+ * Returns the merged object + conflict set, or null if no objects found.
  */
-function mergeArraySamples(arr: unknown[]): Record<string, unknown> | null {
+function mergeArraySamples(arr: unknown[]): MergeResult | null {
   const sampleSize = Math.min(arr.length, MAX_SAMPLE_SIZE);
   const objectSamples = arr
     .slice(0, sampleSize)
@@ -137,27 +198,46 @@ function mergeArraySamples(arr: unknown[]): Record<string, unknown> | null {
  * Recursively infer a GraphQL type from a JSON value.
  * For objects, creates a named GraphQLObjectType with explicit resolvers
  * that map sanitized field names back to original JSON keys.
+ *
+ * Falls back to GraphQLJSON for:
+ * - Arrays with mixed element types (string + number + object)
+ * - Fields with conflicting types across samples
+ * - Values nested deeper than MAX_INFER_DEPTH
  */
 function inferType(
   value: unknown,
   typeName: string,
-  typeRegistry: Map<string, GraphQLObjectType>
+  typeRegistry: Map<string, GraphQLObjectType>,
+  conflicts?: Set<string>,
+  depth: number = 0
 ): GraphQLOutputType {
   if (value === null || value === undefined) {
     return GraphQLString;
+  }
+
+  // Beyond max depth, treat as opaque JSON
+  if (depth >= MAX_INFER_DEPTH) {
+    return GraphQLJSON;
   }
 
   if (Array.isArray(value)) {
     if (value.length === 0) {
       return new GraphQLList(GraphQLString);
     }
+    // Mixed-type arrays → JSON scalar (e.g. ["field", 4296, { "temporal-unit": "day" }])
+    if (hasMixedTypes(value)) {
+      return GraphQLJSON;
+    }
     // Sample multiple elements for richer type inference
-    const merged = mergeArraySamples(value);
-    if (merged) {
-      const elementType = inferType(merged, `${typeName}_Item`, typeRegistry);
+    const mergeResult = mergeArraySamples(value);
+    if (mergeResult) {
+      const elementType = inferType(
+        mergeResult.merged, `${typeName}_Item`, typeRegistry,
+        mergeResult.conflicts, depth + 1
+      );
       return new GraphQLList(elementType);
     }
-    const elementType = inferType(value[0], `${typeName}_Item`, typeRegistry);
+    const elementType = inferType(value[0], `${typeName}_Item`, typeRegistry, conflicts, depth + 1);
     return new GraphQLList(elementType);
   }
 
@@ -200,10 +280,20 @@ function inferType(
       }
       usedNames.add(sanitized);
 
-      const childTypeName = `${typeName}_${sanitized}`;
-      const fieldType = inferType(fieldValue, childTypeName, typeRegistry);
-
       const key = originalKey;
+
+      // Use JSON scalar for fields with type conflicts across samples
+      if (conflicts?.has(originalKey)) {
+        fieldConfigs[sanitized] = {
+          type: GraphQLJSON,
+          resolve: (source: Record<string, unknown>) => source[key],
+        };
+        continue;
+      }
+
+      const childTypeName = `${typeName}_${sanitized}`;
+      const fieldType = inferType(fieldValue, childTypeName, typeRegistry, conflicts, depth + 1);
+
       fieldConfigs[sanitized] = {
         type: fieldType,
         resolve: (source: Record<string, unknown>) => source[key],
@@ -264,11 +354,19 @@ export function buildSchemaFromData(
   if (Array.isArray(data)) {
     let itemType: GraphQLOutputType = GraphQLString;
     if (data.length > 0) {
-      const merged = mergeArraySamples(data);
-      if (merged) {
-        itemType = inferType(merged, `${baseName}_Item`, typeRegistry);
+      // Mixed-type top-level array → items are JSON scalars
+      if (hasMixedTypes(data)) {
+        itemType = GraphQLJSON;
       } else {
-        itemType = inferScalarType(data[0]);
+        const mergeResult = mergeArraySamples(data);
+        if (mergeResult) {
+          itemType = inferType(
+            mergeResult.merged, `${baseName}_Item`, typeRegistry,
+            mergeResult.conflicts, 0
+          );
+        } else {
+          itemType = inferScalarType(data[0]);
+        }
       }
     }
 
