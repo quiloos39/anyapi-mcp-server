@@ -21,7 +21,7 @@ const apiIndex = new ApiIndex(config.spec);
 
 const server = new McpServer({
   name: config.name,
-  version: "1.2.0",
+  version: "1.2.1",
 });
 
 // --- Tool 1: list_api ---
