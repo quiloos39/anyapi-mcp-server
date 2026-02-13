@@ -15,7 +15,7 @@ import {
   truncateIfArray,
 } from "./graphql-schema.js";
 
-const config = loadConfig();
+const config = await loadConfig();
 initLogger(config.logPath ?? null);
 const apiIndex = new ApiIndex(config.spec);
 

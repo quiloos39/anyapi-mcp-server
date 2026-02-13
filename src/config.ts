@@ -1,4 +1,8 @@
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export interface AnyApiConfig {
   name: string;
@@ -34,11 +38,42 @@ function interpolateEnv(value: string): string {
   });
 }
 
-const USAGE = `Usage: anyapi-mcp --name <name> --spec <path> --base-url <url> [--header "Key: Value"]...
+const CACHE_DIR = join(homedir(), ".cache", "anyapi-mcp");
+
+function isUrl(value: string): boolean {
+  return /^https?:\/\//i.test(value);
+}
+
+async function loadSpec(specValue: string): Promise<string> {
+  if (!isUrl(specValue)) {
+    return readFileSync(resolve(specValue), "utf-8");
+  }
+
+  const hash = createHash("sha256").update(specValue).digest("hex");
+  const ext = /\.ya?ml$/i.test(specValue) ? ".yaml" : ".json";
+  const cachePath = join(CACHE_DIR, hash + ext);
+
+  if (existsSync(cachePath)) {
+    return readFileSync(cachePath, "utf-8");
+  }
+
+  const res = await fetch(specValue);
+  if (!res.ok) {
+    throw new Error(`Failed to fetch spec from ${specValue}: ${res.status} ${res.statusText}`);
+  }
+  const body = await res.text();
+
+  mkdirSync(CACHE_DIR, { recursive: true });
+  writeFileSync(cachePath, body, "utf-8");
+
+  return body;
+}
+
+const USAGE = `Usage: anyapi-mcp --name <name> --spec <path-or-url> --base-url <url> [--header "Key: Value"]...
 
 Required:
   --name       Server name (e.g. "petstore")
-  --spec       Path to OpenAPI spec file (JSON or YAML)
+  --spec       Path or URL to OpenAPI spec (JSON or YAML). HTTPS URLs are cached locally.
   --base-url   API base URL (e.g. "https://api.example.com")
 
 Optional:
@@ -46,15 +81,17 @@ Optional:
                Supports \${ENV_VAR} interpolation in values
   --log        Path to request/response log file (NDJSON format)`;
 
-export function loadConfig(): AnyApiConfig {
+export async function loadConfig(): Promise<AnyApiConfig> {
   const name = getArg("--name");
-  const spec = getArg("--spec");
+  const specUrl = getArg("--spec");
   const baseUrl = getArg("--base-url");
 
-  if (!name || !spec || !baseUrl) {
+  if (!name || !specUrl || !baseUrl) {
     console.error(USAGE);
     process.exit(1);
   }
+
+  const spec = await loadSpec(interpolateEnv(specUrl));
 
   const headers: Record<string, string> = {};
   for (const raw of getAllArgs("--header")) {
@@ -72,7 +109,7 @@ export function loadConfig(): AnyApiConfig {
 
   return {
     name,
-    spec: resolve(spec),
+    spec,
     baseUrl: interpolateEnv(baseUrl).replace(/\/+$/, ""),
     headers: Object.keys(headers).length > 0 ? headers : undefined,
     logPath: logPath ? resolve(logPath) : undefined,

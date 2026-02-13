@@ -12,7 +12,8 @@ Works with services like **Datadog**, **PostHog**, **Metabase**, **Cloudflare**,
 
 ## Features
 
-- **Works with any REST API** — provide an OpenAPI (JSON/YAML) or Postman Collection v2.x spec
+- **Works with any REST API** — provide an OpenAPI (JSON/YAML) or Postman Collection v2.x spec as a local file or HTTPS URL
+- **Remote spec caching** — HTTPS spec URLs are fetched once and cached locally in `~/.cache/anyapi-mcp/`
 - **GraphQL-style queries** — select only the fields you need from API responses
 - **Automatic schema inference** — calls an endpoint once, infers the response schema, then lets you query specific fields
 - **Multi-sample merging** — samples up to 10 array elements to build richer schemas that capture fields missing from individual items
@@ -41,15 +42,8 @@ npm install -g anyapi-mcp-server
 | Flag | Description |
 |------|-------------|
 | `--name` | Server name (e.g. `petstore`) |
-
-### Either one of
-
-| Flag | Description |
-|------|-------------|
-| `--spec` | Path to OpenAPI spec file (JSON or YAML) or Postman Collection |
+| `--spec` | Path or HTTPS URL to OpenAPI spec (JSON or YAML) or Postman Collection. HTTPS URLs are cached locally in `~/.cache/anyapi-mcp/`. Supports `${ENV_VAR}` interpolation. |
 | `--base-url` | API base URL (e.g. `https://api.example.com`). Supports `${ENV_VAR}` interpolation. |
-
-You can provide both `--spec` and `--base-url` together. If only `--spec` is given, the base URL is read from the spec. If only `--base-url` is given, endpoints are discovered dynamically.
 
 ### Optional arguments
 
@@ -73,7 +67,7 @@ Add to your MCP configuration (e.g. `~/.cursor/mcp.json` or Claude Desktop confi
         "-y",
         "anyapi-mcp-server",
         "--name", "cloudflare",
-        "--spec", "/path/to/cloudflare-openapi.json",
+        "--spec", "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json",
         "--base-url", "https://api.cloudflare.com/client/v4",
         "--header", "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"
       ],
@@ -96,8 +90,8 @@ Add to your MCP configuration (e.g. `~/.cursor/mcp.json` or Claude Desktop confi
         "-y",
         "anyapi-mcp-server",
         "--name", "datadog",
-        "--spec", "/path/to/datadog-openapi.json",
-        "--base-url", "https://api.datadoghq.com/api/v1",
+        "--spec", "https://raw.githubusercontent.com/DataDog/datadog-api-client-typescript/master/.generator/schemas/v1/openapi.yaml",
+        "--base-url", "https://api.datadoghq.com",
         "--header", "DD-API-KEY: ${DD_API_KEY}",
         "--header", "DD-APPLICATION-KEY: ${DD_APP_KEY}"
       ],
@@ -265,7 +259,7 @@ OpenAPI/Postman spec
                                                response data
 ```
 
-1. The spec file is parsed at startup into an endpoint index with tags, paths, parameters, and request body schemas
+1. The spec is loaded at startup (from a local file or fetched from an HTTPS URL with filesystem caching) and parsed into an endpoint index with tags, paths, parameters, and request body schemas
 2. `call_api` makes a real HTTP request, infers a GraphQL schema from the JSON response, and caches both the response (30s TTL) and the schema
 3. `query_api` re-uses the cached response if called within 30s, executes your GraphQL field selection against the data, and returns only the fields you asked for
 4. Write operations (POST/PUT/DELETE/PATCH) with OpenAPI request body schemas get a Mutation type with typed `GraphQLInputObjectType` inputs

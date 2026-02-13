@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import yaml from "js-yaml";
 import type {
   ApiEndpoint,
@@ -194,10 +193,13 @@ export class ApiIndex {
   private byTag: Map<string, ApiEndpoint[]> = new Map();
   private allEndpoints: ApiEndpoint[] = [];
 
-  constructor(specPath: string) {
-    const raw = readFileSync(specPath, "utf-8");
-    const isYaml = /\.ya?ml$/i.test(specPath);
-    const parsed = isYaml ? yaml.load(raw) : JSON.parse(raw);
+  constructor(specContent: string) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(specContent);
+    } catch {
+      parsed = yaml.load(specContent);
+    }
 
     if (isPostmanCollection(parsed)) {
       this.parsePostman(parsed);
