@@ -38,7 +38,9 @@ function interpolateEnv(value: string): string {
   });
 }
 
-const CACHE_DIR = join(homedir(), ".cache", "anyapi-mcp");
+const CACHE_DIR = process.platform === "win32"
+  ? join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "anyapi-mcp")
+  : join(homedir(), ".cache", "anyapi-mcp");
 
 function isUrl(value: string): boolean {
   return /^https?:\/\//i.test(value);
