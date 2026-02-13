@@ -13,7 +13,7 @@ Works with services like **Datadog**, **PostHog**, **Metabase**, **Cloudflare**,
 ## Features
 
 - **Works with any REST API** — provide an OpenAPI (JSON/YAML) or Postman Collection v2.x spec as a local file or HTTPS URL
-- **Remote spec caching** — HTTPS spec URLs are fetched once and cached locally in `~/.cache/anyapi-mcp/`
+- **Remote spec caching** — HTTPS spec URLs are fetched once and cached locally in ``~/.cache/anyapi-mcp/` (Linux/macOS) or `%LOCALAPPDATA%\anyapi-mcp\` (Windows)`
 - **GraphQL-style queries** — select only the fields you need from API responses
 - **Automatic schema inference** — calls an endpoint once, infers the response schema, then lets you query specific fields
 - **Multi-sample merging** — samples up to 10 array elements to build richer schemas that capture fields missing from individual items
@@ -42,7 +42,7 @@ npm install -g anyapi-mcp-server
 | Flag | Description |
 |------|-------------|
 | `--name` | Server name (e.g. `petstore`) |
-| `--spec` | Path or HTTPS URL to OpenAPI spec (JSON or YAML) or Postman Collection. HTTPS URLs are cached locally in `~/.cache/anyapi-mcp/`. Supports `${ENV_VAR}` interpolation. |
+| `--spec` | Path or HTTPS URL to OpenAPI spec (JSON or YAML) or Postman Collection. HTTPS URLs are cached locally in ``~/.cache/anyapi-mcp/` (Linux/macOS) or `%LOCALAPPDATA%\anyapi-mcp\` (Windows)`. Supports `${ENV_VAR}` interpolation. |
 | `--base-url` | API base URL (e.g. `https://api.example.com`). Supports `${ENV_VAR}` interpolation. |
 
 ### Optional arguments
