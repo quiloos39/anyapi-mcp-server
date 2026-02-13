@@ -6,7 +6,7 @@ import {
   setCache,
   evictExpired,
   clearCache,
-} from "./response-cache.js";
+} from "../src/response-cache.js";
 
 beforeEach(() => {
   clearCache();

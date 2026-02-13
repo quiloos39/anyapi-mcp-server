@@ -7,7 +7,7 @@ vi.mock("node:fs/promises", () => ({
   appendFile: mockAppendFile,
 }));
 
-import { initLogger, isLoggingEnabled, logEntry, type LogEntry } from "./logger.js";
+import { initLogger, isLoggingEnabled, logEntry, type LogEntry } from "../src/logger.js";
 
 function makeEntry(overrides: Partial<LogEntry> = {}): LogEntry {
   return {

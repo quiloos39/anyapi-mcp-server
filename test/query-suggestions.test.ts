@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { generateSuggestions } from "./query-suggestions.js";
-import { buildSchemaFromData } from "./graphql-schema.js";
+import { generateSuggestions } from "../src/query-suggestions.js";
+import { buildSchemaFromData } from "../src/graphql-schema.js";
 import { GraphQLSchema, GraphQLObjectType, GraphQLString } from "graphql";
 
 describe("generateSuggestions", () => {

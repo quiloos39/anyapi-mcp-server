@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { isRetryableStatus, RetryableError, withRetry } from "./retry.js";
+import { isRetryableStatus, RetryableError, withRetry } from "../src/retry.js";
 
 describe("isRetryableStatus", () => {
   it.each([429, 500, 502, 503, 504])("returns true for %d", (status) => {

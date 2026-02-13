@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ApiIndex } from "./api-index.js";
+import { ApiIndex } from "../src/api-index.js";
 
 const OPENAPI_SPEC = JSON.stringify({
   openapi: "3.0.0",

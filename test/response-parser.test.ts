@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseResponse } from "./response-parser.js";
+import { parseResponse } from "../src/response-parser.js";
 
 describe("parseResponse", () => {
   describe("JSON", () => {

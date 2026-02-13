@@ -5,7 +5,7 @@ import {
   getOrBuildSchema,
   schemaToSDL,
   executeQuery,
-} from "./graphql-schema.js";
+} from "../src/graphql-schema.js";
 
 describe("truncateIfArray", () => {
   it("returns non-array data unchanged", () => {
