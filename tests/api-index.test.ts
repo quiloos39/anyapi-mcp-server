@@ -152,19 +152,19 @@ const POSTMAN_COLLECTION = JSON.stringify({
 
 describe("ApiIndex - OpenAPI", () => {
   it("parses JSON OpenAPI spec", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const categories = index.listAllCategories();
     expect(categories.length).toBeGreaterThanOrEqual(2);
   });
 
   it("parses YAML OpenAPI spec", () => {
-    const index = new ApiIndex(OPENAPI_YAML);
+    const index = new ApiIndex([OPENAPI_YAML]);
     const categories = index.listAllCategories();
     expect(categories).toEqual([{ tag: "items", endpointCount: 1 }]);
   });
 
   it("extracts method, path, summary, description, tag", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("GET", "/pets");
     expect(ep).toBeDefined();
     expect(ep!.method).toBe("GET");
@@ -175,7 +175,7 @@ describe("ApiIndex - OpenAPI", () => {
   });
 
   it("extracts parameters", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("GET", "/pets");
     expect(ep!.parameters).toEqual([
       { name: "limit", in: "query", required: false, description: "Max items" },
@@ -183,13 +183,13 @@ describe("ApiIndex - OpenAPI", () => {
   });
 
   it("detects hasRequestBody on POST", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("POST", "/pets");
     expect(ep!.hasRequestBody).toBe(true);
   });
 
   it("extracts requestBodySchema", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("POST", "/pets");
     expect(ep!.requestBodySchema).toBeDefined();
     expect(ep!.requestBodySchema!.properties.name.type).toBe("string");
@@ -199,7 +199,7 @@ describe("ApiIndex - OpenAPI", () => {
   });
 
   it("resolves $ref in requestBody schema", () => {
-    const index = new ApiIndex(OPENAPI_WITH_REF);
+    const index = new ApiIndex([OPENAPI_WITH_REF]);
     const ep = index.getEndpoint("POST", "/pets");
     expect(ep!.requestBodySchema).toBeDefined();
     expect(ep!.requestBodySchema!.properties.name.type).toBe("string");
@@ -208,13 +208,13 @@ describe("ApiIndex - OpenAPI", () => {
   });
 
   it("extracts response descriptions", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("GET", "/pets");
     expect(ep!.responses).toEqual([{ statusCode: "200", description: "Success" }]);
   });
 
   it("extracts operationId, deprecated, externalDocs", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("GET", "/pets/{petId}");
     expect(ep!.operationId).toBe("getPetById");
     expect(ep!.deprecated).toBe(true);
@@ -225,7 +225,7 @@ describe("ApiIndex - OpenAPI", () => {
   });
 
   it("defaults tag to 'untagged'", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("GET", "/untagged-endpoint");
     expect(ep!.tag).toBe("untagged");
   });
@@ -233,37 +233,37 @@ describe("ApiIndex - OpenAPI", () => {
 
 describe("ApiIndex - Postman Collection", () => {
   it("parses Postman Collection", () => {
-    const index = new ApiIndex(POSTMAN_COLLECTION);
+    const index = new ApiIndex([POSTMAN_COLLECTION]);
     const categories = index.listAllCategories();
     expect(categories.length).toBeGreaterThanOrEqual(1);
   });
 
   it("uses folder names as tags", () => {
-    const index = new ApiIndex(POSTMAN_COLLECTION);
+    const index = new ApiIndex([POSTMAN_COLLECTION]);
     const eps = index.listAllByCategory("Users");
     expect(eps.length).toBe(2);
   });
 
   it("converts :param to {param}", () => {
-    const index = new ApiIndex(POSTMAN_COLLECTION);
+    const index = new ApiIndex([POSTMAN_COLLECTION]);
     const ep = index.getEndpoint("GET", "/users/{userId}");
     expect(ep).toBeDefined();
   });
 
   it("extracts query parameters", () => {
-    const index = new ApiIndex(POSTMAN_COLLECTION);
+    const index = new ApiIndex([POSTMAN_COLLECTION]);
     const ep = index.getEndpoint("GET", "/users");
     expect(ep!.parameters.some((p) => p.name === "page" && p.in === "query")).toBe(true);
   });
 
   it("extracts path variables", () => {
-    const index = new ApiIndex(POSTMAN_COLLECTION);
+    const index = new ApiIndex([POSTMAN_COLLECTION]);
     const ep = index.getEndpoint("GET", "/users/{userId}");
     expect(ep!.parameters.some((p) => p.name === "userId" && p.in === "path")).toBe(true);
   });
 
   it("detects hasRequestBody", () => {
-    const index = new ApiIndex(POSTMAN_COLLECTION);
+    const index = new ApiIndex([POSTMAN_COLLECTION]);
     const ep = index.getEndpoint("POST", "/posts");
     expect(ep!.hasRequestBody).toBe(true);
   });
@@ -271,7 +271,7 @@ describe("ApiIndex - Postman Collection", () => {
 
 describe("listAllCategories", () => {
   it("returns sorted categories with endpoint counts", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const categories = index.listAllCategories();
     // Should be sorted alphabetically
     const tags = categories.map((c) => c.tag);
@@ -284,69 +284,169 @@ describe("listAllCategories", () => {
 
 describe("listAllByCategory", () => {
   it("returns endpoints for existing category", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const eps = index.listAllByCategory("stores");
     expect(eps.length).toBe(1);
     expect(eps[0].path).toBe("/stores");
   });
 
   it("returns empty array for unknown category", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     expect(index.listAllByCategory("nonexistent")).toEqual([]);
+  });
+
+  it("is case-insensitive", () => {
+    const index = new ApiIndex([OPENAPI_SPEC]);
+    const eps = index.listAllByCategory("Stores");
+    expect(eps.length).toBe(1);
+    expect(eps[0].path).toBe("/stores");
+    expect(index.listAllByCategory("PETS").length).toBe(3);
   });
 });
 
 describe("searchAll", () => {
   it("matches by path", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const results = index.searchAll("stores");
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0].path).toBe("/stores");
   });
 
   it("matches by summary", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const results = index.searchAll("Create pet");
     expect(results.length).toBe(1);
     expect(results[0].method).toBe("POST");
   });
 
-  it("matches by description", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+  it("does not match by description", () => {
+    const index = new ApiIndex([OPENAPI_SPEC]);
+    // "Returns all" only appears in description, not path or summary
     const results = index.searchAll("Returns all");
-    expect(results.length).toBe(1);
+    expect(results.length).toBe(0);
   });
 
   it("is case-insensitive", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const results = index.searchAll("LIST PETS");
     expect(results.length).toBeGreaterThanOrEqual(1);
   });
 
   it("returns empty for no matches", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     expect(index.searchAll("zzz_nonexistent")).toEqual([]);
+  });
+
+  it("supports regex patterns", () => {
+    const index = new ApiIndex([OPENAPI_SPEC]);
+    const results = index.searchAll("^/pets$");
+    expect(results.length).toBe(2); // GET /pets, POST /pets (not /pets/{petId})
+  });
+
+  it("supports regex alternation", () => {
+    const index = new ApiIndex([OPENAPI_SPEC]);
+    const results = index.searchAll("stores|untagged");
+    expect(results.length).toBe(2);
+  });
+
+  it("falls back to literal match on invalid regex", () => {
+    const index = new ApiIndex([OPENAPI_SPEC]);
+    // Invalid regex — should fall back to substring match and find nothing
+    expect(index.searchAll("[invalid")).toEqual([]);
   });
 });
 
 describe("getEndpoint", () => {
   it("finds endpoint by method + path", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("GET", "/pets");
     expect(ep).toBeDefined();
   });
 
   it("returns undefined for non-existent endpoint", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     expect(index.getEndpoint("DELETE", "/pets")).toBeUndefined();
   });
 
   it("method matching is case-insensitive (uppercase)", () => {
-    const index = new ApiIndex(OPENAPI_SPEC);
+    const index = new ApiIndex([OPENAPI_SPEC]);
     const ep = index.getEndpoint("get", "/pets");
     // The method is stored as uppercase, so lowercase search should not match
     // unless the code uppercases the search. Let's check actual behavior:
     // getEndpoint does: ep.method === method.toUpperCase()
     expect(ep).toBeDefined();
+  });
+});
+
+describe("Multiple specs", () => {
+  const ORDERS_SPEC = JSON.stringify({
+    openapi: "3.0.0",
+    info: { title: "Orders API", version: "1.0" },
+    paths: {
+      "/orders": {
+        get: { summary: "List orders", tags: ["orders"] },
+        post: { summary: "Create order", tags: ["orders"] },
+      },
+    },
+  });
+
+  it("merges endpoints from multiple specs", () => {
+    const index = new ApiIndex([OPENAPI_SPEC, ORDERS_SPEC]);
+    const categories = index.listAllCategories();
+    const tags = categories.map((c) => c.tag);
+    expect(tags).toContain("pets");
+    expect(tags).toContain("orders");
+  });
+
+  it("all endpoints are searchable across specs", () => {
+    const index = new ApiIndex([OPENAPI_SPEC, ORDERS_SPEC]);
+    expect(index.getEndpoint("GET", "/pets")).toBeDefined();
+    expect(index.getEndpoint("GET", "/orders")).toBeDefined();
+    expect(index.getEndpoint("POST", "/orders")).toBeDefined();
+  });
+
+  it("search spans all specs", () => {
+    const index = new ApiIndex([OPENAPI_SPEC, ORDERS_SPEC]);
+    const results = index.searchAll("List");
+    const paths = results.map((r) => r.path);
+    expect(paths).toContain("/pets");
+    expect(paths).toContain("/orders");
+  });
+
+  it("merges endpoints under the same tag from different specs", () => {
+    const extraPetsSpec = JSON.stringify({
+      openapi: "3.0.0",
+      info: { title: "Extra Pets", version: "1.0" },
+      paths: {
+        "/pets/{petId}/toys": {
+          get: { summary: "List pet toys", tags: ["pets"] },
+        },
+      },
+    });
+    const index = new ApiIndex([OPENAPI_SPEC, extraPetsSpec]);
+    const pets = index.listAllCategories().find((c) => c.tag === "pets");
+    expect(pets!.endpointCount).toBe(4); // 3 from OPENAPI_SPEC + 1 from extraPetsSpec
+  });
+
+  it("mixes JSON and YAML specs", () => {
+    const index = new ApiIndex([OPENAPI_SPEC, OPENAPI_YAML]);
+    expect(index.getEndpoint("GET", "/pets")).toBeDefined();
+    expect(index.getEndpoint("GET", "/items")).toBeDefined();
+  });
+
+  it("first spec takes precedence for duplicate endpoints", () => {
+    const altSpec = JSON.stringify({
+      openapi: "3.0.0",
+      info: { title: "Alt", version: "1.0" },
+      paths: {
+        "/pets": {
+          get: { summary: "Alt list pets", tags: ["pets"] },
+        },
+      },
+    });
+    const index = new ApiIndex([OPENAPI_SPEC, altSpec]);
+    // getEndpoint uses find(), so the first match (from OPENAPI_SPEC) wins
+    const ep = index.getEndpoint("GET", "/pets");
+    expect(ep!.summary).toBe("List pets");
   });
 });

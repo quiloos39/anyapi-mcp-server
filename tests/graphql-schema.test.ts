@@ -298,6 +298,127 @@ describe("computeShapeHash", () => {
   });
 });
 
+describe("mutation execution", () => {
+  const bodySchema = {
+    contentType: "application/json" as const,
+    properties: {
+      name: { type: "string", required: true },
+      age: { type: "integer", required: false },
+    },
+  };
+
+  it("executes mutation query on POST with object response", async () => {
+    const data = { id: 1, name: "created", status: "ok" };
+    const schema = buildSchemaFromData(data, "POST", "/test/exec-mut-post", bodySchema);
+    const result = await executeQuery(
+      schema, data,
+      "mutation { post_POST_test_exec_mut_post { id name status } }"
+    );
+    expect(result).toEqual({
+      post_POST_test_exec_mut_post: { id: 1, name: "created", status: "ok" },
+    });
+  });
+
+  it("executes mutation query on PUT with object response", async () => {
+    const data = { id: 1, name: "updated" };
+    const schema = buildSchemaFromData(data, "PUT", "/test/exec-mut-put", bodySchema);
+    const result = await executeQuery(
+      schema, data,
+      "mutation { put_PUT_test_exec_mut_put { id name } }"
+    );
+    expect(result).toEqual({
+      put_PUT_test_exec_mut_put: { id: 1, name: "updated" },
+    });
+  });
+
+  it("executes mutation query on DELETE with object response", async () => {
+    const data = { deleted: true, id: 42 };
+    const schema = buildSchemaFromData(data, "DELETE", "/test/exec-mut-del", bodySchema);
+    const result = await executeQuery(
+      schema, data,
+      "mutation { delete_DELETE_test_exec_mut_del { deleted id } }"
+    );
+    expect(result).toEqual({
+      delete_DELETE_test_exec_mut_del: { deleted: true, id: 42 },
+    });
+  });
+
+  it("executes mutation query on PATCH with object response", async () => {
+    const data = { id: 5, name: "patched" };
+    const schema = buildSchemaFromData(data, "PATCH", "/test/exec-mut-patch", bodySchema);
+    const result = await executeQuery(
+      schema, data,
+      "mutation { patch_PATCH_test_exec_mut_patch { id name } }"
+    );
+    expect(result).toEqual({
+      patch_PATCH_test_exec_mut_patch: { id: 5, name: "patched" },
+    });
+  });
+
+  it("executes mutation query on POST with array response", async () => {
+    const data = [{ id: 1 }, { id: 2 }];
+    const schema = buildSchemaFromData(data, "POST", "/test/exec-mut-arr", bodySchema);
+    const result = await executeQuery(
+      schema, data,
+      "mutation { post_POST_test_exec_mut_arr { items { id } _count } }"
+    );
+    expect(result).toEqual({
+      post_POST_test_exec_mut_arr: { items: [{ id: 1 }, { id: 2 }], _count: 2 },
+    });
+  });
+
+  it("accepts input args in mutation without affecting result", async () => {
+    const data = { id: 1, name: "created" };
+    const schema = buildSchemaFromData(data, "POST", "/test/exec-mut-input", bodySchema);
+    const result = await executeQuery(
+      schema, data,
+      'mutation { post_POST_test_exec_mut_input(input: { name: "test" }) { id name } }'
+    );
+    expect(result).toEqual({
+      post_POST_test_exec_mut_input: { id: 1, name: "created" },
+    });
+  });
+
+  it("write method without requestBodySchema uses Query syntax", async () => {
+    const data = { id: 1, status: "deleted" };
+    const schema = buildSchemaFromData(data, "DELETE", "/test/no-body-schema");
+    expect(schema.getMutationType()).toBeUndefined();
+    const result = await executeQuery(schema, data, "{ id status }");
+    expect(result).toEqual({ id: 1, status: "deleted" });
+  });
+
+  it("POST without requestBodySchema uses Query syntax", async () => {
+    const data = { id: 99, created: true };
+    const schema = buildSchemaFromData(data, "POST", "/test/post-no-schema");
+    expect(schema.getMutationType()).toBeUndefined();
+    const result = await executeQuery(schema, data, "{ id created }");
+    expect(result).toEqual({ id: 99, created: true });
+  });
+
+  it("mutation SDL includes input type name and fields", () => {
+    const data = { id: 1 };
+    const schema = buildSchemaFromData(data, "POST", "/api/users", bodySchema);
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("type Mutation");
+    expect(sdl).toContain("POST_api_users_Input");
+    expect(sdl).toContain("name: String!");
+    expect(sdl).toContain("age: Int");
+  });
+
+  it("bodyHash discriminates cache for different bodies on same endpoint", () => {
+    const data = { id: 1, status: "ok" };
+    const bodyA = computeShapeHash({ name: "test" });
+    const bodyB = computeShapeHash({ title: "post", count: 1 });
+    const r1 = getOrBuildSchema(data, "POST", "/test/cache-body-disc", bodySchema, bodyA);
+    const r2 = getOrBuildSchema(data, "POST", "/test/cache-body-disc", bodySchema, bodyB);
+    expect(r1.schema).not.toBe(r2.schema);
+    expect(bodyA).not.toBe(bodyB);
+    // Same bodyHash reuses cache
+    const r3 = getOrBuildSchema(data, "POST", "/test/cache-body-disc", bodySchema, bodyA);
+    expect(r3.schema).toBe(r1.schema);
+  });
+});
+
 describe("schemaToSDL", () => {
   it("returns valid SDL string", () => {
     const schema = buildSchemaFromData({ id: 1, name: "test" }, "GET", "/test/sdl");

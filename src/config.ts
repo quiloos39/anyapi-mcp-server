@@ -6,7 +6,7 @@ import { join } from "node:path";
 
 export interface AnyApiConfig {
   name: string;
-  spec: string;
+  specs: string[];
   baseUrl: string;
   headers?: Record<string, string>;
   logPath?: string;
@@ -75,7 +75,7 @@ const USAGE = `Usage: anyapi-mcp --name <name> --spec <path-or-url> --base-url <
 
 Required:
   --name       Server name (e.g. "petstore")
-  --spec       Path or URL to OpenAPI spec (JSON or YAML). HTTPS URLs are cached locally.
+  --spec       Path or URL to OpenAPI spec (JSON or YAML) (repeatable for multiple specs)
   --base-url   API base URL (e.g. "https://api.example.com")
 
 Optional:
@@ -85,15 +85,17 @@ Optional:
 
 export async function loadConfig(): Promise<AnyApiConfig> {
   const name = getArg("--name");
-  const specUrl = getArg("--spec");
+  const specUrls = getAllArgs("--spec");
   const baseUrl = getArg("--base-url");
 
-  if (!name || !specUrl || !baseUrl) {
+  if (!name || specUrls.length === 0 || !baseUrl) {
     console.error(USAGE);
     process.exit(1);
   }
 
-  const spec = await loadSpec(interpolateEnv(specUrl));
+  const specs = await Promise.all(
+    specUrls.map((url) => loadSpec(interpolateEnv(url)))
+  );
 
   const headers: Record<string, string> = {};
   for (const raw of getAllArgs("--header")) {
@@ -111,7 +113,7 @@ export async function loadConfig(): Promise<AnyApiConfig> {
 
   return {
     name,
-    spec,
+    specs,
     baseUrl: interpolateEnv(baseUrl).replace(/\/+$/, ""),
     headers: Object.keys(headers).length > 0 ? headers : undefined,
     logPath: logPath ? resolve(logPath) : undefined,

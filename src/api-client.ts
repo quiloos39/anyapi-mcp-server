@@ -54,7 +54,7 @@ export async function callApi(
 
   let fullUrl = `${config.baseUrl}${interpolatedPath}`;
 
-  if (method === "GET" && Object.keys(remainingParams).length > 0) {
+  if (Object.keys(remainingParams).length > 0) {
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(remainingParams)) {
       if (v !== undefined && v !== null) {

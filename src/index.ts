@@ -20,7 +20,7 @@ const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
 const config = await loadConfig();
 initLogger(config.logPath ?? null);
-const apiIndex = new ApiIndex(config.spec);
+const apiIndex = new ApiIndex(config.specs);
 
 const server = new McpServer({
   name: config.name,
@@ -31,28 +31,25 @@ const server = new McpServer({
 server.tool(
   "list_api",
   `List available ${config.name} API endpoints. ` +
-    "Call with no arguments to see all categories. " +
-    "Provide 'category' to list endpoints in a tag. " +
-    "Provide 'search' to search across paths and descriptions. " +
-    "The correct query format is auto-selected based on mode. " +
-    "You can optionally override with a custom 'query' parameter. " +
+    "Call with no arguments to see all endpoints. " +
+    "Provide 'category' to filter by tag. " +
+    "Provide 'search' to search across paths and summaries (supports regex). " +
     "Results are paginated with limit (default 20) and offset.",
   {
     category: z
       .string()
       .optional()
-      .describe("Tag/category to filter by. Omit to see all categories."),
+      .describe("Tag/category to filter by. Case-insensitive."),
     search: z
       .string()
       .optional()
-      .describe("Search keyword across endpoint paths and descriptions"),
+      .describe("Search keyword or regex pattern across endpoint paths and summaries"),
     query: z
       .string()
       .optional()
       .describe(
-        "Optional GraphQL selection query override. If omitted, a sensible default is used automatically:\n" +
-          "Categories (no args): '{ items { tag endpointCount } _count }'\n" +
-          "Endpoints (with category/search): '{ items { method path summary tag parameters { name in required description } } _count }'"
+        "GraphQL selection query. Default: '{ items { method path summary } _count }'. " +
+          "Available fields: method, path, summary, tag, parameters { name in required description }"
       ),
     limit: z
       .number()
@@ -69,14 +66,13 @@ server.tool(
   },
   async ({ category, search, query, limit, offset }) => {
     try {
-      const isEndpointMode = !!(search || category);
       let data: unknown[];
       if (search) {
         data = apiIndex.searchAll(search);
       } else if (category) {
         data = apiIndex.listAllByCategory(category);
       } else {
-        data = apiIndex.listAllCategories();
+        data = apiIndex.listAll();
       }
 
       // Empty results — return directly to avoid GraphQL schema errors on empty arrays
@@ -88,12 +84,10 @@ server.tool(
         };
       }
 
-      const defaultQuery = isEndpointMode
-        ? "{ items { method path summary tag parameters { name in required description } } _count }"
-        : "{ items { tag endpointCount } _count }";
+      const defaultQuery = "{ items { method path summary } _count }";
       const effectiveQuery = query ?? defaultQuery;
 
-      const { schema } = getOrBuildSchema(data, "LIST", category ?? search ?? "_categories");
+      const { schema } = getOrBuildSchema(data, "LIST", category ?? search ?? "_all");
       const { data: sliced, truncated, total } = truncateIfArray(data, limit ?? 20, offset);
       const queryResult = await executeQuery(schema, sliced, effectiveQuery);
 

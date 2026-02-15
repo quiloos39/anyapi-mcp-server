@@ -193,18 +193,20 @@ export class ApiIndex {
   private byTag: Map<string, ApiEndpoint[]> = new Map();
   private allEndpoints: ApiEndpoint[] = [];
 
-  constructor(specContent: string) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(specContent);
-    } catch {
-      parsed = yaml.load(specContent);
-    }
+  constructor(specContents: string[]) {
+    for (const specContent of specContents) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(specContent);
+      } catch {
+        parsed = yaml.load(specContent);
+      }
 
-    if (isPostmanCollection(parsed)) {
-      this.parsePostman(parsed);
-    } else {
-      this.parseOpenApi(parsed as OpenApiSpec, parsed as Record<string, unknown>);
+      if (isPostmanCollection(parsed)) {
+        this.parsePostman(parsed);
+      } else {
+        this.parseOpenApi(parsed as OpenApiSpec, parsed as Record<string, unknown>);
+      }
     }
   }
 
@@ -340,6 +342,16 @@ export class ApiIndex {
     tagList.push(endpoint);
   }
 
+  listAll(): ApiEndpointSummary[] {
+    return this.allEndpoints.map((ep) => ({
+      method: ep.method,
+      path: ep.path,
+      summary: ep.summary,
+      tag: ep.tag,
+      parameters: ep.parameters,
+    }));
+  }
+
   listAllCategories(): CategorySummary[] {
     const categories: CategorySummary[] = [];
     for (const [tag, endpoints] of this.byTag) {
@@ -350,7 +362,9 @@ export class ApiIndex {
   }
 
   listAllByCategory(category: string): ApiEndpointSummary[] {
-    const endpoints = this.byTag.get(category) ?? [];
+    const lower = category.toLowerCase();
+    const key = [...this.byTag.keys()].find((k) => k.toLowerCase() === lower);
+    const endpoints = key ? this.byTag.get(key)! : [];
     return endpoints.map((ep) => ({
       method: ep.method,
       path: ep.path,
@@ -361,13 +375,20 @@ export class ApiIndex {
   }
 
   searchAll(keyword: string): ApiEndpointSummary[] {
-    const lower = keyword.toLowerCase();
+    let matcher: (text: string) => boolean;
+    try {
+      const re = new RegExp(keyword, "i");
+      matcher = (text) => re.test(text);
+    } catch {
+      const lower = keyword.toLowerCase();
+      matcher = (text) => text.toLowerCase().includes(lower);
+    }
+
     return this.allEndpoints
       .filter(
         (ep) =>
-          ep.path.toLowerCase().includes(lower) ||
-          ep.summary.toLowerCase().includes(lower) ||
-          ep.description.toLowerCase().includes(lower)
+          matcher(ep.path) ||
+          matcher(ep.summary)
       )
       .map((ep) => ({
         method: ep.method,
