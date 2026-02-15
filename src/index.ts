@@ -13,7 +13,10 @@ import {
   executeQuery,
   schemaToSDL,
   truncateIfArray,
+  computeShapeHash,
 } from "./graphql-schema.js";
+
+const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
 const config = await loadConfig();
 initLogger(config.logPath ?? null);
@@ -90,7 +93,7 @@ server.tool(
         : "{ items { tag endpointCount } _count }";
       const effectiveQuery = query ?? defaultQuery;
 
-      const schema = getOrBuildSchema(data, "LIST", category ?? search ?? "_categories");
+      const { schema } = getOrBuildSchema(data, "LIST", category ?? search ?? "_categories");
       const { data: sliced, truncated, total } = truncateIfArray(data, limit ?? 20, offset);
       const queryResult = await executeQuery(schema, sliced, effectiveQuery);
 
@@ -173,10 +176,12 @@ server.tool(
       );
 
       const endpoint = apiIndex.getEndpoint(method, path);
-      const schema = getOrBuildSchema(data, method, path, endpoint?.requestBodySchema);
+      const bodyHash = WRITE_METHODS.has(method) && body ? computeShapeHash(body) : undefined;
+      const { schema, shapeHash } = getOrBuildSchema(data, method, path, endpoint?.requestBodySchema, bodyHash);
       const sdl = schemaToSDL(schema);
 
-      const result: Record<string, unknown> = { graphqlSchema: sdl };
+      const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash };
+      if (bodyHash) result.bodyHash = bodyHash;
 
       if (endpoint && endpoint.parameters.length > 0) {
         result.parameters = endpoint.parameters.map((p) => ({
@@ -295,17 +300,22 @@ server.tool(
       );
 
       const endpoint = apiIndex.getEndpoint(method, path);
-      const schema = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema);
+      const bodyHash = WRITE_METHODS.has(method) && body ? computeShapeHash(body) : undefined;
+      const { schema, shapeHash } = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema, bodyHash);
       const { data, truncated, total } = truncateIfArray(rawData, limit, offset);
       const queryResult = await executeQuery(schema, data, query);
 
-      if (truncated && typeof queryResult === "object" && queryResult !== null) {
-        (queryResult as Record<string, unknown>)._meta = {
-          total,
-          offset: offset ?? 0,
-          limit: limit ?? 50,
-          hasMore: true,
-        };
+      if (typeof queryResult === "object" && queryResult !== null) {
+        (queryResult as Record<string, unknown>)._shapeHash = shapeHash;
+        if (bodyHash) (queryResult as Record<string, unknown>)._bodyHash = bodyHash;
+        if (truncated) {
+          (queryResult as Record<string, unknown>)._meta = {
+            total,
+            offset: offset ?? 0,
+            limit: limit ?? 50,
+            hasMore: true,
+          };
+        }
       }
 
       return {
@@ -473,15 +483,25 @@ server.tool(
           );
 
           const endpoint = apiIndex.getEndpoint(req.method, req.path);
-          const schema = getOrBuildSchema(
+          const bodyHash = WRITE_METHODS.has(req.method) && req.body
+            ? computeShapeHash(req.body as Record<string, unknown>)
+            : undefined;
+          const { schema, shapeHash } = getOrBuildSchema(
             rawData,
             req.method,
             req.path,
-            endpoint?.requestBodySchema
+            endpoint?.requestBodySchema,
+            bodyHash
           );
           const queryResult = await executeQuery(schema, rawData, req.query);
 
-          return { method: req.method, path: req.path, data: queryResult };
+          return {
+            method: req.method,
+            path: req.path,
+            data: queryResult,
+            shapeHash,
+            ...(bodyHash ? { bodyHash } : {}),
+          };
         })
       );
 

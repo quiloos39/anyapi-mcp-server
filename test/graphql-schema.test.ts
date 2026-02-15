@@ -5,6 +5,7 @@ import {
   getOrBuildSchema,
   schemaToSDL,
   executeQuery,
+  computeShapeHash,
 } from "../src/graphql-schema.js";
 
 describe("truncateIfArray", () => {
@@ -207,18 +208,93 @@ describe("buildSchemaFromData - mutation types", () => {
 });
 
 describe("getOrBuildSchema", () => {
-  it("caches schema by method + path", () => {
+  it("caches schema by method + path + shape", () => {
     const data = { id: 1 };
-    const s1 = getOrBuildSchema(data, "GET", "/test/cache-a");
-    const s2 = getOrBuildSchema(data, "GET", "/test/cache-a");
-    expect(s1).toBe(s2); // same reference
+    const r1 = getOrBuildSchema(data, "GET", "/test/cache-a2");
+    const r2 = getOrBuildSchema(data, "GET", "/test/cache-a2");
+    expect(r1.schema).toBe(r2.schema); // same reference
+    expect(r1.shapeHash).toBe(r2.shapeHash);
   });
 
   it("different method+path produces different schema", () => {
     const data = { id: 1 };
-    const s1 = getOrBuildSchema(data, "GET", "/test/cache-b");
-    const s2 = getOrBuildSchema(data, "POST", "/test/cache-b");
-    expect(s1).not.toBe(s2);
+    const r1 = getOrBuildSchema(data, "GET", "/test/cache-b2");
+    const r2 = getOrBuildSchema(data, "POST", "/test/cache-b2");
+    expect(r1.schema).not.toBe(r2.schema);
+  });
+
+  it("different shapes on same path produce different schemas", () => {
+    const data1 = { id: 1, name: "Alice" };
+    const data2 = { id: 2, score: 99, tags: ["a", "b"] };
+    const r1 = getOrBuildSchema(data1, "GET", "/test/cache-shape");
+    const r2 = getOrBuildSchema(data2, "GET", "/test/cache-shape");
+    expect(r1.schema).not.toBe(r2.schema);
+    expect(r1.shapeHash).not.toBe(r2.shapeHash);
+  });
+
+  it("same shape different values reuses cached schema", () => {
+    const data1 = { id: 1, name: "Alice" };
+    const data2 = { id: 2, name: "Bob" };
+    const r1 = getOrBuildSchema(data1, "GET", "/test/cache-same");
+    const r2 = getOrBuildSchema(data2, "GET", "/test/cache-same");
+    expect(r1.schema).toBe(r2.schema);
+    expect(r1.shapeHash).toBe(r2.shapeHash);
+  });
+
+  it("uses cacheHash for cache key when provided", () => {
+    const data = { id: 1, status: "ok" };
+    const bodyHash = computeShapeHash({ name: "test" });
+    const r1 = getOrBuildSchema(data, "PUT", "/test/cache-body", undefined, bodyHash);
+    const r2 = getOrBuildSchema(data, "PUT", "/test/cache-body", undefined, bodyHash);
+    expect(r1.schema).toBe(r2.schema);
+    expect(r1.shapeHash).toBe(r2.shapeHash);
+  });
+
+  it("returns a 12-character hex shapeHash", () => {
+    const { shapeHash } = getOrBuildSchema({ id: 1 }, "GET", "/test/hash-fmt");
+    expect(shapeHash).toMatch(/^[0-9a-f]{12}$/);
+  });
+});
+
+describe("computeShapeHash", () => {
+  it("same structure different values produce same hash", () => {
+    expect(computeShapeHash({ id: 1, name: "Alice" }))
+      .toBe(computeShapeHash({ id: 42, name: "Bob" }));
+  });
+
+  it("different structure produces different hash", () => {
+    expect(computeShapeHash({ id: 1, name: "Alice" }))
+      .not.toBe(computeShapeHash({ id: 1, score: 99.5 }));
+  });
+
+  it("key order does not affect hash", () => {
+    expect(computeShapeHash({ a: 1, b: "two" }))
+      .toBe(computeShapeHash({ b: "hello", a: 42 }));
+  });
+
+  it("arrays with same element shape produce same hash", () => {
+    expect(computeShapeHash([{ id: 1, name: "a" }]))
+      .toBe(computeShapeHash([{ id: 3, name: "c" }]));
+  });
+
+  it("arrays with different element shapes produce different hash", () => {
+    expect(computeShapeHash([{ id: 1, name: "a" }]))
+      .not.toBe(computeShapeHash([{ id: 1, tags: ["x"] }]));
+  });
+
+  it("returns 12-char hex string", () => {
+    expect(computeShapeHash({ x: 1 })).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  it("handles null and undefined", () => {
+    expect(computeShapeHash(null)).toMatch(/^[0-9a-f]{12}$/);
+    expect(computeShapeHash(undefined)).toMatch(/^[0-9a-f]{12}$/);
+    expect(computeShapeHash(null)).toBe(computeShapeHash(undefined));
+  });
+
+  it("same scalar type produces same hash", () => {
+    expect(computeShapeHash("hello")).toBe(computeShapeHash("world"));
+    expect(computeShapeHash(1)).toBe(computeShapeHash(99));
   });
 });
 

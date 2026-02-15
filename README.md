@@ -19,6 +19,7 @@ Works with services like **Datadog**, **PostHog**, **Metabase**, **Cloudflare**,
 - **Multi-sample merging** — samples up to 10 array elements to build richer schemas that capture fields missing from individual items
 - **Mutation support** — POST/PUT/DELETE/PATCH endpoints with OpenAPI request body schemas get GraphQL mutation types with typed inputs
 - **Smart query suggestions** — `call_api` returns ready-to-use GraphQL queries based on the inferred schema
+- **Shape-aware schema caching** — schemas are cached by response structure (not just endpoint), so the same path returning different shapes gets distinct schemas; `shapeHash` is returned for cache-aware workflows
 - **Response caching** — 30-second TTL cache prevents duplicate HTTP calls across consecutive `call_api` → `query_api` flows
 - **Retry with backoff** — automatic retries with exponential backoff and jitter for 429/5xx errors, honoring `Retry-After` headers
 - **Multi-format responses** — parses JSON, XML, CSV, and plain text responses automatically
@@ -167,6 +168,8 @@ Inspect an API endpoint by making a real request and returning the inferred Grap
 - Returns the full schema SDL showing all available fields and types
 - Returns accepted parameters (name, location, required) from the API spec
 - Returns `suggestedQueries` — ready-to-use GraphQL queries generated from the schema
+- Returns `shapeHash` — a structural fingerprint of the response for cache-aware workflows
+- Returns `bodyHash` for write operations when a request body is provided
 - Accepts optional `headers` to override defaults for this request
 - For write operations (POST/PUT/DELETE/PATCH) with request body schemas, the schema includes a Mutation type
 
@@ -207,6 +210,7 @@ Fetch data from an API endpoint, returning only the fields you select via GraphQ
 - Supports `limit` and `offset` for client-side slicing of already-fetched data
 - For API-level pagination, pass limit/offset inside `params` instead
 - Accepts optional `headers` to override defaults for this request
+- Response includes `_shapeHash` (and `_bodyHash` for writes) for tracking schema identity
 
 ### `explain_api`
 
@@ -225,7 +229,7 @@ Fetch data from multiple endpoints concurrently in a single tool call.
 - Accepts an array of 1–10 requests, each with `method`, `path`, `params`, `body`, `query`, and optional `headers`
 - All requests execute in parallel via `Promise.allSettled` — one failure does not affect the others
 - Each request follows the `query_api` flow: HTTP fetch → schema inference → GraphQL field selection
-- Returns an array of results: `{ method, path, data }` on success or `{ method, path, error }` on failure
+- Returns an array of results: `{ method, path, data, shapeHash }` on success or `{ method, path, error }` on failure
 - Run `call_api` first on each endpoint to discover the schema field names
 
 ## Workflow
@@ -260,8 +264,8 @@ OpenAPI/Postman spec
 ```
 
 1. The spec is loaded at startup (from a local file or fetched from an HTTPS URL with filesystem caching) and parsed into an endpoint index with tags, paths, parameters, and request body schemas
-2. `call_api` makes a real HTTP request, infers a GraphQL schema from the JSON response, and caches both the response (30s TTL) and the schema
-3. `query_api` re-uses the cached response if called within 30s, executes your GraphQL field selection against the data, and returns only the fields you asked for
+2. `call_api` makes a real HTTP request, infers a GraphQL schema from the JSON response, and caches both the response (30s TTL) and the schema. Schemas are keyed by endpoint + response shape, so the same path returning different structures gets distinct schemas
+3. `query_api` re-uses the cached response if called within 30s, executes your GraphQL field selection against the data, and returns only the fields you asked for. Includes `_shapeHash` in the response for tracking schema identity
 4. Write operations (POST/PUT/DELETE/PATCH) with OpenAPI request body schemas get a Mutation type with typed `GraphQLInputObjectType` inputs
 
 ## Supported Spec Formats

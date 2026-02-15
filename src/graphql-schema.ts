@@ -15,6 +15,7 @@ import {
   printSchema,
 } from "graphql";
 import type { GraphQLFieldConfigMap, GraphQLInputFieldConfigMap } from "graphql";
+import { createHash } from "node:crypto";
 import type { RequestBodySchema } from "./types.js";
 
 const DEFAULT_ARRAY_LIMIT = 50;
@@ -54,8 +55,8 @@ export function truncateIfArray(
   return { data: sliced, truncated: sliced.length < total, total };
 }
 
-function cacheKey(method: string, pathTemplate: string): string {
-  return `${method}:${pathTemplate}`;
+function cacheKey(method: string, pathTemplate: string, hash: string): string {
+  return `${method}:${pathTemplate}:${hash}`;
 }
 
 /**
@@ -192,6 +193,50 @@ function mergeArraySamples(arr: unknown[]): MergeResult | null {
     );
   if (objectSamples.length === 0) return null;
   return mergeSamples(objectSamples);
+}
+
+/**
+ * Produce a structural fingerprint string from JSON data.
+ * Captures keys + recursive type structure but NOT values.
+ * Sorted keys ensure determinism regardless of object key order.
+ * Bounded by MAX_INFER_DEPTH to match inference behavior.
+ */
+function shapeFingerprint(data: unknown, depth: number = 0): string {
+  if (data === null || data === undefined) return "n";
+  if (depth >= MAX_INFER_DEPTH) return "J";
+
+  if (Array.isArray(data)) {
+    if (data.length === 0) return "[]";
+    if (hasMixedTypes(data)) return "[J]";
+    const mergeResult = mergeArraySamples(data);
+    if (mergeResult) return `[${shapeFingerprint(mergeResult.merged, depth + 1)}]`;
+    return `[${shapeFingerprint(data[0], depth + 1)}]`;
+  }
+
+  if (typeof data === "object") {
+    const obj = data as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    if (keys.length === 0) return "{}";
+    return `{${keys.map((k) => `${k}:${shapeFingerprint(obj[k], depth + 1)}`).join(",")}}`;
+  }
+
+  switch (typeof data) {
+    case "number":
+      return Number.isInteger(data) ? "i" : "f";
+    case "boolean":
+      return "b";
+    default:
+      return "s";
+  }
+}
+
+/**
+ * Compute a truncated SHA-256 hash of the structural fingerprint of JSON data.
+ * Returns a 12-character hex string.
+ */
+export function computeShapeHash(data: unknown): string {
+  const fp = shapeFingerprint(data);
+  return createHash("sha256").update(fp).digest("hex").slice(0, 12);
 }
 
 /**
@@ -464,20 +509,28 @@ export function buildSchemaFromData(
 
 /**
  * Get a cached schema or build + cache a new one from the response data.
+ *
+ * @param cacheHash Optional hash to use as the cache key discriminator.
+ *   If provided (e.g. body hash for mutations), it is used instead of the
+ *   response shape hash for cache lookup. The shapeHash is always computed
+ *   from the response data and returned regardless.
  */
 export function getOrBuildSchema(
   data: unknown,
   method: string,
   pathTemplate: string,
-  requestBodySchema?: RequestBodySchema
-): GraphQLSchema {
-  const key = cacheKey(method, pathTemplate);
+  requestBodySchema?: RequestBodySchema,
+  cacheHash?: string
+): { schema: GraphQLSchema; shapeHash: string } {
+  const shapeHash = computeShapeHash(data);
+  const effectiveHash = cacheHash ?? shapeHash;
+  const key = cacheKey(method, pathTemplate, effectiveHash);
   const cached = schemaCache.get(key);
-  if (cached) return cached;
+  if (cached) return { schema: cached, shapeHash };
 
   const schema = buildSchemaFromData(data, method, pathTemplate, requestBodySchema);
   schemaCache.set(key, schema);
-  return schema;
+  return { schema, shapeHash };
 }
 
 /**
