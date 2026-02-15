@@ -3,6 +3,7 @@ import { withRetry, RetryableError, isRetryableStatus } from "./retry.js";
 import { buildCacheKey, consumeCached, setCache } from "./response-cache.js";
 import { logEntry, isLoggingEnabled } from "./logger.js";
 import { parseResponse } from "./response-parser.js";
+import { ApiError } from "./error-context.js";
 
 const TIMEOUT_MS = 30_000;
 
@@ -91,12 +92,13 @@ export async function callApi(
       const durationMs = Date.now() - startTime;
       const bodyText = await response.text();
 
+      const responseHeaders: Record<string, string> = {};
+      response.headers.forEach((v, k) => {
+        responseHeaders[k] = v;
+      });
+
       // Log request/response
       if (isLoggingEnabled()) {
-        const responseHeaders: Record<string, string> = {};
-        response.headers.forEach((v, k) => {
-          responseHeaders[k] = v;
-        });
         await logEntry({
           timestamp: new Date().toISOString(),
           method,
@@ -111,8 +113,8 @@ export async function callApi(
       }
 
       if (!response.ok) {
-        const msg = `API error ${response.status} ${response.statusText}: ${bodyText}`;
         if (isRetryableStatus(response.status)) {
+          const msg = `API error ${response.status} ${response.statusText}: ${bodyText}`;
           let retryAfterMs: number | undefined;
           const retryAfter = response.headers.get("retry-after");
           if (retryAfter) {
@@ -121,7 +123,13 @@ export async function callApi(
           }
           throw new RetryableError(msg, response.status, retryAfterMs);
         }
-        throw new Error(msg);
+        throw new ApiError(
+          `API error ${response.status} ${response.statusText}`,
+          response.status,
+          response.statusText,
+          bodyText,
+          responseHeaders
+        );
       }
 
       return parseResponse(response.headers.get("content-type"), bodyText);

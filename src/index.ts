@@ -15,12 +15,34 @@ import {
   truncateIfArray,
   computeShapeHash,
 } from "./graphql-schema.js";
+import { ApiError, buildErrorContext } from "./error-context.js";
+import { RetryableError } from "./retry.js";
 
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
 const config = await loadConfig();
 initLogger(config.logPath ?? null);
 const apiIndex = new ApiIndex(config.specs);
+
+function formatToolError(
+  error: unknown,
+  method?: string,
+  path?: string
+): { content: { type: "text"; text: string }[]; isError: true } {
+  if ((error instanceof ApiError || error instanceof RetryableError) && method && path) {
+    const endpoint = apiIndex.getEndpoint(method, path);
+    const context = buildErrorContext(error, method, path, endpoint);
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(context, null, 2) }],
+      isError: true,
+    };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ error: message }) }],
+    isError: true,
+  };
+}
 
 const server = new McpServer({
   name: config.name,
@@ -213,13 +235,7 @@ server.tool(
         ],
       };
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          { type: "text" as const, text: JSON.stringify({ error: message }) },
-        ],
-        isError: true,
-      };
+      return formatToolError(error, method, path);
     }
   }
 );
@@ -318,13 +334,7 @@ server.tool(
         ],
       };
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          { type: "text" as const, text: JSON.stringify({ error: message }) },
-        ],
-        isError: true,
-      };
+      return formatToolError(error, method, path);
     }
   }
 );
@@ -503,10 +513,13 @@ server.tool(
         if (outcome.status === "fulfilled") {
           return outcome.value;
         }
+        const reason = outcome.reason;
+        if (reason instanceof ApiError || reason instanceof RetryableError) {
+          const endpoint = apiIndex.getEndpoint(requests[i].method, requests[i].path);
+          return buildErrorContext(reason, requests[i].method, requests[i].path, endpoint);
+        }
         const message =
-          outcome.reason instanceof Error
-            ? outcome.reason.message
-            : String(outcome.reason);
+          reason instanceof Error ? reason.message : String(reason);
         return {
           method: requests[i].method,
           path: requests[i].path,

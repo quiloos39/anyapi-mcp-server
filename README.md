@@ -28,6 +28,7 @@ Works with services like **Datadog**, **PostHog**, **Metabase**, **Cloudflare**,
 - **Concurrent batch queries** — `batch_query` fetches data from up to 10 endpoints in parallel, returning all results in one tool call
 - **Per-request headers** — override default headers on individual `call_api`/`query_api`/`batch_query` calls
 - **Environment variable interpolation** — use `${ENV_VAR}` in base URLs and headers
+- **Rich error context** — API errors return structured messages (parses RFC 7807, `{ error: { message, code } }`, `{ errors: [...] }`, and more), status-specific suggestions (e.g. "Authentication required" for 401), and relevant spec info (required parameters, request body schema) for 400/422 errors so the LLM can self-correct
 - **Request logging** — optional NDJSON request/response log with sensitive header masking
 
 [![npm](https://img.shields.io/npm/v/anyapi-mcp-server)](https://www.npmjs.com/package/anyapi-mcp-server)
@@ -229,7 +230,7 @@ Fetch data from multiple endpoints concurrently in a single tool call.
 - Accepts an array of 1–10 requests, each with `method`, `path`, `params`, `body`, `query`, and optional `headers`
 - All requests execute in parallel via `Promise.allSettled` — one failure does not affect the others
 - Each request follows the `query_api` flow: HTTP fetch → schema inference → GraphQL field selection
-- Returns an array of results: `{ method, path, data, shapeHash }` on success or `{ method, path, error }` on failure
+- Returns an array of results: `{ method, path, data, shapeHash }` on success or a structured error with status, suggestion, and spec context on failure
 - Run `call_api` first on each endpoint to discover the schema field names
 
 ## Workflow
@@ -267,6 +268,7 @@ OpenAPI/Postman spec
 2. `call_api` makes a real HTTP request, infers a GraphQL schema from the JSON response, and caches both the response (30s TTL) and the schema. Schemas are keyed by endpoint + response shape, so the same path returning different structures gets distinct schemas
 3. `query_api` re-uses the cached response if called within 30s, executes your GraphQL field selection against the data, and returns only the fields you asked for. Includes `_shapeHash` in the response for tracking schema identity
 4. Write operations (POST/PUT/DELETE/PATCH) with OpenAPI request body schemas get a Mutation type with typed `GraphQLInputObjectType` inputs
+5. When an API call fails, the error response includes a parsed error message (extracted from common formats like RFC 7807 Problem Details, `{ error: { message } }`, GraphQL-style `{ errors: [...] }`), the HTTP status code, a status-specific suggestion for what to try next, and — for validation errors (400/422) — the full parameter list and request body schema from the spec
 
 ## Supported Spec Formats
 

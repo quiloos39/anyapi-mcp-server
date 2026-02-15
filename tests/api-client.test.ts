@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { callApi } from "../src/api-client.js";
+import { ApiError } from "../src/error-context.js";
 import type { AnyApiConfig } from "../src/config.js";
 
 const baseConfig: AnyApiConfig = {
@@ -72,4 +73,44 @@ describe("callApi - query parameters for non-GET methods", () => {
     const opts = fetchSpy.mock.calls[0][1] as RequestInit;
     expect(opts.body).toBe('{"reason":"cleanup"}');
   });
+});
+
+describe("callApi - error handling", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("throws ApiError with full context for non-retryable HTTP errors", async () => {
+    const errorBody = JSON.stringify({ message: "User not found" });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(errorBody, {
+        status: 404,
+        statusText: "Not Found",
+        headers: { "Content-Type": "application/json", "x-request-id": "req-123" },
+      })
+    );
+
+    try {
+      await callApi(baseConfig, "GET", "/users/{id}", { id: "999" });
+      expect.unreachable("should have thrown");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ApiError);
+      const apiErr = err as ApiError;
+      expect(apiErr.status).toBe(404);
+      expect(apiErr.statusText).toBe("Not Found");
+      expect(apiErr.bodyText).toBe(errorBody);
+      expect(apiErr.responseHeaders["x-request-id"]).toBe("req-123");
+    }
+  });
+
+  it("throws ApiError for 400 with structured body", async () => {
+    const errorBody = JSON.stringify({ error: { message: "Invalid email", code: "validation_error" } });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+      new Response(errorBody, { status: 400, statusText: "Bad Request" })
+    );
+
+    await expect(callApi(baseConfig, "POST", "/users", undefined, { email: "bad" }))
+      .rejects.toThrow(ApiError);
+  });
+
 });
