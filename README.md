@@ -47,15 +47,15 @@ npm install -g anyapi-mcp-server
 
 Ready-to-use configurations for popular APIs:
 
-| Provider | Auth | Spec source |
-|----------|------|-------------|
-| [Cloudflare](docs/cloudflare.md) | API Token or Key + Email | Remote (GitHub) |
-| [Datadog](docs/datadog.md) | API Key + App Key | Remote (GitHub) |
-| [GitHub](docs/github.md) | Personal Access Token | Remote (GitHub) |
-| [Google Workspace](docs/google-workspace.md) | OAuth 2.0 | Remote (APIs-guru) |
-| [Metabase](docs/metabase.md) | API Key | Self-hosted (instance serves its own spec) |
-| [PostHog](docs/posthog.md) | Personal API Key | Self-hosted (PostHog serves its own spec) |
-| [Slack](docs/slack.md) | Bot/User Token | Remote (GitHub) |
+| Provider | Auth |
+|----------|------|
+| [Cloudflare](docs/cloudflare.md) | API Token or Key + Email |
+| [Datadog](docs/datadog.md) | API Key + App Key |
+| [GitHub](docs/github.md) | Personal Access Token |
+| [Google Workspace](docs/google-workspace.md) | OAuth 2.0 |
+| [Metabase](docs/metabase.md) | API Key |
+| [PostHog](docs/posthog.md) | Personal API Key |
+| [Slack](docs/slack.md) | Bot/User Token |
 
 These work with any API that has an OpenAPI or Postman spec — the above are just examples. Stripe, Twilio, Shopify, HubSpot, and anything else with a REST API will work the same way.
 
