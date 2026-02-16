@@ -28,6 +28,7 @@ Works with services like **Datadog**, **PostHog**, **Metabase**, **Cloudflare**,
 - **Concurrent batch queries** — `batch_query` fetches data from up to 10 endpoints in parallel, returning all results in one tool call
 - **Per-request headers** — override default headers on individual `call_api`/`query_api`/`batch_query` calls
 - **Environment variable interpolation** — use `${ENV_VAR}` in base URLs and headers
+- **OAuth 2.0 authentication** — supports Authorization Code (with PKCE) and Client Credentials flows via `--oauth-*` CLI flags. A temporary localhost server captures the OAuth callback automatically. Tokens are persisted to `~/.cache/anyapi-mcp/tokens/` and auto-refreshed on expiry. OAuth endpoints can be auto-detected from OpenAPI `securitySchemes`
 - **Rich error context** — API errors return structured messages (parses RFC 7807, `{ error: { message, code } }`, `{ errors: [...] }`, and more), status-specific suggestions (e.g. "Authentication required" for 401), and relevant spec info (required parameters, request body schema) for 400/422 errors so the LLM can self-correct
 - **Request logging** — optional NDJSON request/response log with sensitive header masking
 
@@ -53,6 +54,20 @@ npm install -g anyapi-mcp-server
 |------|-------------|
 | `--header` | HTTP header as `"Key: Value"` (repeatable). Supports `${ENV_VAR}` interpolation in values. |
 | `--log` | Path to request/response log file (NDJSON format). Sensitive headers are masked automatically. |
+
+### OAuth arguments
+
+All OAuth flags support `${ENV_VAR}` interpolation. If any of `--oauth-client-id`, `--oauth-client-secret`, or `--oauth-token-url` is provided, all three are required.
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--oauth-client-id` | Yes* | OAuth client ID |
+| `--oauth-client-secret` | Yes* | OAuth client secret |
+| `--oauth-token-url` | Yes* | Token endpoint URL |
+| `--oauth-auth-url` | No | Authorization endpoint (required for `authorization_code` flow unless discoverable from the OpenAPI spec's `securitySchemes`) |
+| `--oauth-scopes` | No | Comma-separated scopes |
+| `--oauth-flow` | No | `authorization_code` (default) or `client_credentials` |
+| `--oauth-param` | No | Extra token request parameter as `key=value` (repeatable, e.g. `--oauth-param "access_type=offline"`) |
 
 ### Example: Cursor / Claude Desktop configuration
 
@@ -128,9 +143,41 @@ Add to your MCP configuration (e.g. `~/.cursor/mcp.json` or Claude Desktop confi
 }
 ```
 
+### Example: Google Workspace with OAuth
+
+```json
+{
+  "mcpServers": {
+    "google-workspace": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "anyapi-mcp-server",
+        "--name", "google-workspace",
+        "--spec", "https://raw.githubusercontent.com/APIs-guru/openapi-directory/main/APIs/googleapis.com/admin/directory_v1/openapi.yaml",
+        "--base-url", "https://admin.googleapis.com",
+        "--oauth-client-id", "${GOOGLE_CLIENT_ID}",
+        "--oauth-client-secret", "${GOOGLE_CLIENT_SECRET}",
+        "--oauth-auth-url", "https://accounts.google.com/o/oauth2/v2/auth",
+        "--oauth-token-url", "https://oauth2.googleapis.com/token",
+        "--oauth-scopes", "https://www.googleapis.com/auth/admin.directory.user.readonly",
+        "--oauth-param", "access_type=offline",
+        "--oauth-param", "prompt=consent"
+      ],
+      "env": {
+        "GOOGLE_CLIENT_ID": "your-client-id.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_SECRET": "your-client-secret"
+      }
+    }
+  }
+}
+```
+
+After starting, use the `auth` tool to authenticate: call `auth` with `action: "start"` to get an authorization URL, visit it in a browser, then call `auth` with `action: "exchange"` — the callback is captured automatically via a localhost server. Tokens are persisted and refreshed automatically on subsequent runs.
+
 ## Tools
 
-The server exposes five MCP tools:
+The server exposes five MCP tools (plus `auth` when OAuth is configured):
 
 ### `list_api`
 
@@ -232,6 +279,16 @@ Fetch data from multiple endpoints concurrently in a single tool call.
 - Each request follows the `query_api` flow: HTTP fetch → schema inference → GraphQL field selection
 - Returns an array of results: `{ method, path, data, shapeHash }` on success or a structured error with status, suggestion, and spec context on failure
 - Run `call_api` first on each endpoint to discover the schema field names
+
+### `auth` (when OAuth is configured)
+
+Manage OAuth 2.0 authentication. Only registered when `--oauth-*` flags are provided.
+
+- `action: "start"` — begins the OAuth flow. For `authorization_code`: starts a localhost callback server and returns an authorization URL to visit. For `client_credentials`: exchanges credentials and returns tokens directly
+- `action: "exchange"` — completes the authorization code flow. The callback is captured automatically by the localhost server; optionally accepts a `code` parameter for manual entry
+- `action: "status"` — returns current token status (authenticated, expired, expiry time, scopes, whether a refresh token is available)
+
+Tokens are persisted to `~/.cache/anyapi-mcp/tokens/<name>.json` (Linux/macOS) or `%LOCALAPPDATA%\anyapi-mcp\tokens\<name>.json` (Windows) and loaded automatically on server restart. Expired tokens are refreshed transparently — `authorization_code` tokens use the refresh token, `client_credentials` tokens are re-acquired. Explicit `Authorization` headers (via `--header` or per-request `headers`) always take priority over OAuth tokens.
 
 ## Workflow
 
