@@ -8,6 +8,7 @@ import type {
   ListApiResult,
   RequestBodySchema,
   RequestBodyProperty,
+  OAuthSecurityScheme,
 } from "./types.js";
 
 const PAGE_SIZE = 20;
@@ -192,6 +193,7 @@ function postmanUrlToPath(url: string | PostmanUrl): string {
 export class ApiIndex {
   private byTag: Map<string, ApiEndpoint[]> = new Map();
   private allEndpoints: ApiEndpoint[] = [];
+  private oauthSchemes: OAuthSecurityScheme[] = [];
 
   constructor(specContents: string[]) {
     for (const specContent of specContents) {
@@ -266,6 +268,59 @@ export class ApiIndex {
         this.addEndpoint(endpoint);
       }
     }
+
+    this.extractSecuritySchemes(rawSpec);
+  }
+
+  private extractSecuritySchemes(spec: Record<string, unknown>): void {
+    // OpenAPI 3.x: components.securitySchemes
+    const components = spec.components as Record<string, unknown> | undefined;
+    const securitySchemes = components?.securitySchemes as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+
+    // OpenAPI 2.x (Swagger): securityDefinitions
+    const securityDefs = spec.securityDefinitions as
+      | Record<string, Record<string, unknown>>
+      | undefined;
+
+    const schemes = securitySchemes ?? securityDefs ?? {};
+
+    for (const schemeDef of Object.values(schemes)) {
+      if (schemeDef.type !== "oauth2") continue;
+
+      // OpenAPI 3.x: flows.authorizationCode, flows.clientCredentials, etc.
+      const flows = schemeDef.flows as
+        | Record<string, Record<string, unknown>>
+        | undefined;
+      if (flows) {
+        for (const flow of Object.values(flows)) {
+          const scopes = flow.scopes
+            ? Object.keys(flow.scopes as Record<string, unknown>)
+            : [];
+          this.oauthSchemes.push({
+            authorizationUrl: flow.authorizationUrl as string | undefined,
+            tokenUrl: flow.tokenUrl as string | undefined,
+            scopes,
+          });
+        }
+        continue;
+      }
+
+      // OpenAPI 2.x (Swagger): direct fields on the scheme
+      const scopes = schemeDef.scopes
+        ? Object.keys(schemeDef.scopes as Record<string, unknown>)
+        : [];
+      this.oauthSchemes.push({
+        authorizationUrl: schemeDef.authorizationUrl as string | undefined,
+        tokenUrl: schemeDef.tokenUrl as string | undefined,
+        scopes,
+      });
+    }
+  }
+
+  getOAuthSchemes(): OAuthSecurityScheme[] {
+    return this.oauthSchemes;
   }
 
   private parsePostman(collection: PostmanCollection): void {

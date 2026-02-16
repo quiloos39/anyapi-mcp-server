@@ -450,3 +450,111 @@ describe("Multiple specs", () => {
     expect(ep!.summary).toBe("List pets");
   });
 });
+
+describe("getOAuthSchemes - OpenAPI 3.x", () => {
+  it("extracts OAuth2 authorizationCode flow", () => {
+    const spec = JSON.stringify({
+      openapi: "3.0.0",
+      info: { title: "Test", version: "1.0" },
+      paths: { "/test": { get: { summary: "Test" } } },
+      components: {
+        securitySchemes: {
+          oauth2: {
+            type: "oauth2",
+            flows: {
+              authorizationCode: {
+                authorizationUrl: "https://auth.example.com/authorize",
+                tokenUrl: "https://auth.example.com/token",
+                scopes: {
+                  "read:data": "Read data",
+                  "write:data": "Write data",
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+    const index = new ApiIndex([spec]);
+    const schemes = index.getOAuthSchemes();
+    expect(schemes).toHaveLength(1);
+    expect(schemes[0].authorizationUrl).toBe("https://auth.example.com/authorize");
+    expect(schemes[0].tokenUrl).toBe("https://auth.example.com/token");
+    expect(schemes[0].scopes).toEqual(["read:data", "write:data"]);
+  });
+
+  it("extracts multiple flows from a single scheme", () => {
+    const spec = JSON.stringify({
+      openapi: "3.0.0",
+      info: { title: "Test", version: "1.0" },
+      paths: { "/test": { get: { summary: "Test" } } },
+      components: {
+        securitySchemes: {
+          oauth2: {
+            type: "oauth2",
+            flows: {
+              authorizationCode: {
+                authorizationUrl: "https://auth.example.com/authorize",
+                tokenUrl: "https://auth.example.com/token",
+                scopes: { read: "Read" },
+              },
+              clientCredentials: {
+                tokenUrl: "https://auth.example.com/token",
+                scopes: { admin: "Admin" },
+              },
+            },
+          },
+        },
+      },
+    });
+    const index = new ApiIndex([spec]);
+    const schemes = index.getOAuthSchemes();
+    expect(schemes).toHaveLength(2);
+  });
+
+  it("ignores non-oauth2 security schemes", () => {
+    const spec = JSON.stringify({
+      openapi: "3.0.0",
+      info: { title: "Test", version: "1.0" },
+      paths: { "/test": { get: { summary: "Test" } } },
+      components: {
+        securitySchemes: {
+          apiKey: { type: "apiKey", in: "header", name: "X-API-Key" },
+          bearer: { type: "http", scheme: "bearer" },
+        },
+      },
+    });
+    const index = new ApiIndex([spec]);
+    expect(index.getOAuthSchemes()).toHaveLength(0);
+  });
+
+  it("returns empty for specs without securitySchemes", () => {
+    const index = new ApiIndex([OPENAPI_SPEC]);
+    expect(index.getOAuthSchemes()).toHaveLength(0);
+  });
+});
+
+describe("getOAuthSchemes - OpenAPI 2.x (Swagger)", () => {
+  it("extracts OAuth2 from securityDefinitions", () => {
+    const spec = JSON.stringify({
+      swagger: "2.0",
+      info: { title: "Test", version: "1.0" },
+      basePath: "/",
+      paths: { "/test": { get: { summary: "Test" } } },
+      securityDefinitions: {
+        oauth2: {
+          type: "oauth2",
+          authorizationUrl: "https://auth.example.com/authorize",
+          tokenUrl: "https://auth.example.com/token",
+          scopes: { read: "Read", write: "Write" },
+        },
+      },
+    });
+    const index = new ApiIndex([spec]);
+    const schemes = index.getOAuthSchemes();
+    expect(schemes).toHaveLength(1);
+    expect(schemes[0].authorizationUrl).toBe("https://auth.example.com/authorize");
+    expect(schemes[0].tokenUrl).toBe("https://auth.example.com/token");
+    expect(schemes[0].scopes).toEqual(["read", "write"]);
+  });
+});

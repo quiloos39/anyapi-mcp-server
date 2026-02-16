@@ -73,6 +73,18 @@ describe("callApi - query parameters for non-GET methods", () => {
     const opts = fetchSpy.mock.calls[0][1] as RequestInit;
     expect(opts.body).toBe('{"reason":"cleanup"}');
   });
+
+  it("returns data and responseHeaders", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ id: 1 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "x-request-id": "abc" },
+      })
+    );
+    const result = await callApi(baseConfig, "GET", "/items");
+    expect(result.data).toEqual({ id: 1 });
+    expect(result.responseHeaders["x-request-id"]).toBe("abc");
+  });
 });
 
 describe("callApi - error handling", () => {

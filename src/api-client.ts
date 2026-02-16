@@ -4,6 +4,12 @@ import { buildCacheKey, consumeCached, setCache } from "./response-cache.js";
 import { logEntry, isLoggingEnabled } from "./logger.js";
 import { parseResponse } from "./response-parser.js";
 import { ApiError } from "./error-context.js";
+import { getValidAccessToken, refreshTokens } from "./oauth.js";
+
+export interface ApiResult {
+  data: unknown;
+  responseHeaders: Record<string, string>;
+}
 
 const TIMEOUT_MS = 30_000;
 
@@ -37,13 +43,13 @@ export async function callApi(
   body?: Record<string, unknown>,
   extraHeaders?: Record<string, string>,
   cacheMode: "populate" | "consume" | "none" = "none"
-): Promise<unknown> {
+): Promise<ApiResult> {
   // --- Cache check (consume mode only) ---
   const cacheKey = cacheMode !== "none"
     ? buildCacheKey(method, pathTemplate, params, body, extraHeaders)
     : "";
   if (cacheMode === "consume") {
-    const cached = consumeCached(cacheKey);
+    const cached = consumeCached(cacheKey) as ApiResult | undefined;
     if (cached !== undefined) return cached;
   }
 
@@ -65,85 +71,124 @@ export async function callApi(
     fullUrl += `?${qs.toString()}`;
   }
 
-  const mergedHeaders: Record<string, string> = {
-    "Content-Type": "application/json",
+  // Check if an explicit Authorization header was provided by the caller
+  const hasExplicitAuth = Object.keys({
     ...config.headers,
     ...extraHeaders,
+  }).some((k) => k.toLowerCase() === "authorization");
+
+  const doRequest = async (): Promise<ApiResult> => {
+    const mergedHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...config.headers,
+      ...extraHeaders,
+    };
+
+    // Inject OAuth bearer token if no explicit Authorization header
+    if (!hasExplicitAuth) {
+      const accessToken = await getValidAccessToken(config.oauth);
+      if (accessToken) {
+        mergedHeaders["Authorization"] = `Bearer ${accessToken}`;
+      }
+    }
+
+    return withRetry(async () => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
+      const startTime = Date.now();
+
+      try {
+        const fetchOptions: RequestInit = {
+          method,
+          headers: mergedHeaders,
+          signal: controller.signal,
+        };
+
+        if (body && method !== "GET") {
+          fetchOptions.body = JSON.stringify(body);
+        }
+
+        const response = await fetch(fullUrl, fetchOptions);
+        const durationMs = Date.now() - startTime;
+        const bodyText = await response.text();
+
+        const responseHeaders: Record<string, string> = {};
+        response.headers.forEach((v, k) => {
+          responseHeaders[k] = v;
+        });
+
+        // Log request/response
+        if (isLoggingEnabled()) {
+          await logEntry({
+            timestamp: new Date().toISOString(),
+            method,
+            url: fullUrl,
+            requestHeaders: mergedHeaders,
+            requestBody: body,
+            responseStatus: response.status,
+            responseHeaders,
+            responseBody: bodyText,
+            durationMs,
+          });
+        }
+
+        if (!response.ok) {
+          if (isRetryableStatus(response.status)) {
+            const msg = `API error ${response.status} ${response.statusText}: ${bodyText}`;
+            let retryAfterMs: number | undefined;
+            const retryAfter = response.headers.get("retry-after");
+            if (retryAfter) {
+              const seconds = parseInt(retryAfter, 10);
+              if (!isNaN(seconds)) retryAfterMs = seconds * 1000;
+            }
+            throw new RetryableError(msg, response.status, retryAfterMs);
+          }
+          throw new ApiError(
+            `API error ${response.status} ${response.statusText}`,
+            response.status,
+            response.statusText,
+            bodyText,
+            responseHeaders
+          );
+        }
+
+        const parsedData = parseResponse(response.headers.get("content-type"), bodyText);
+        return { data: parsedData, responseHeaders } as ApiResult;
+      } catch (error: unknown) {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          throw new Error(
+            `Request to ${method} ${pathTemplate} timed out after ${TIMEOUT_MS / 1000}s`
+          );
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    });
   };
 
-  // --- Retry-wrapped fetch ---
-  const result = await withRetry(async () => {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
-    const startTime = Date.now();
-
-    try {
-      const fetchOptions: RequestInit = {
-        method,
-        headers: mergedHeaders,
-        signal: controller.signal,
-      };
-
-      if (body && method !== "GET") {
-        fetchOptions.body = JSON.stringify(body);
+  // --- Execute with 401 refresh-and-retry ---
+  let result: ApiResult;
+  try {
+    result = await doRequest();
+  } catch (error) {
+    if (
+      error instanceof ApiError &&
+      error.status === 401 &&
+      config.oauth &&
+      !hasExplicitAuth
+    ) {
+      // Refresh token and retry once
+      try {
+        await refreshTokens(config.oauth);
+        result = await doRequest();
+      } catch {
+        throw error; // Throw the original 401
       }
-
-      const response = await fetch(fullUrl, fetchOptions);
-      const durationMs = Date.now() - startTime;
-      const bodyText = await response.text();
-
-      const responseHeaders: Record<string, string> = {};
-      response.headers.forEach((v, k) => {
-        responseHeaders[k] = v;
-      });
-
-      // Log request/response
-      if (isLoggingEnabled()) {
-        await logEntry({
-          timestamp: new Date().toISOString(),
-          method,
-          url: fullUrl,
-          requestHeaders: mergedHeaders,
-          requestBody: body,
-          responseStatus: response.status,
-          responseHeaders,
-          responseBody: bodyText,
-          durationMs,
-        });
-      }
-
-      if (!response.ok) {
-        if (isRetryableStatus(response.status)) {
-          const msg = `API error ${response.status} ${response.statusText}: ${bodyText}`;
-          let retryAfterMs: number | undefined;
-          const retryAfter = response.headers.get("retry-after");
-          if (retryAfter) {
-            const seconds = parseInt(retryAfter, 10);
-            if (!isNaN(seconds)) retryAfterMs = seconds * 1000;
-          }
-          throw new RetryableError(msg, response.status, retryAfterMs);
-        }
-        throw new ApiError(
-          `API error ${response.status} ${response.statusText}`,
-          response.status,
-          response.statusText,
-          bodyText,
-          responseHeaders
-        );
-      }
-
-      return parseResponse(response.headers.get("content-type"), bodyText);
-    } catch (error: unknown) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        throw new Error(
-          `Request to ${method} ${pathTemplate} timed out after ${TIMEOUT_MS / 1000}s`
-        );
-      }
+    } else {
       throw error;
-    } finally {
-      clearTimeout(timeout);
     }
-  });
+  }
 
   // --- Cache store (populate mode only) ---
   if (cacheMode === "populate") {

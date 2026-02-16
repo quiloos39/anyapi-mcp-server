@@ -4,12 +4,15 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { OAuthConfig, OAuthFlow } from "./types.js";
+
 export interface AnyApiConfig {
   name: string;
   specs: string[];
   baseUrl: string;
   headers?: Record<string, string>;
   logPath?: string;
+  oauth?: OAuthConfig;
 }
 
 function getArg(flag: string): string | undefined {
@@ -81,7 +84,17 @@ Required:
 Optional:
   --header     HTTP header as "Key: Value" (repeatable)
                Supports \${ENV_VAR} interpolation in values
-  --log        Path to request/response log file (NDJSON format)`;
+  --log        Path to request/response log file (NDJSON format)
+
+OAuth 2.0 (all optional, but client-id/client-secret/token-url are required together):
+  --oauth-client-id      OAuth client ID
+  --oauth-client-secret  OAuth client secret
+  --oauth-token-url      OAuth token endpoint URL
+  --oauth-auth-url       OAuth authorization endpoint URL (authorization_code flow)
+  --oauth-scopes         Comma-separated scopes (e.g. "read,write")
+  --oauth-flow           "authorization_code" (default) or "client_credentials"
+  --oauth-param          Extra auth URL param as "key=value" (repeatable)
+               All OAuth values support \${ENV_VAR} interpolation`;
 
 export async function loadConfig(): Promise<AnyApiConfig> {
   const name = getArg("--name");
@@ -111,11 +124,68 @@ export async function loadConfig(): Promise<AnyApiConfig> {
 
   const logPath = getArg("--log");
 
+  // --- OAuth CLI flags ---
+  const oauthClientId = getArg("--oauth-client-id");
+  const oauthClientSecret = getArg("--oauth-client-secret");
+  const oauthTokenUrl = getArg("--oauth-token-url");
+  const oauthAuthUrl = getArg("--oauth-auth-url");
+  const oauthScopes = getArg("--oauth-scopes");
+  const oauthFlow = getArg("--oauth-flow");
+  const oauthParams = getAllArgs("--oauth-param");
+
+  const hasAnyOAuth = oauthClientId || oauthClientSecret || oauthTokenUrl;
+  if (hasAnyOAuth && !(oauthClientId && oauthClientSecret && oauthTokenUrl)) {
+    console.error(
+      "ERROR: --oauth-client-id, --oauth-client-secret, and --oauth-token-url must all be provided together."
+    );
+    process.exit(1);
+  }
+
+  let oauth: OAuthConfig | undefined;
+  if (oauthClientId && oauthClientSecret && oauthTokenUrl) {
+    const extraParams: Record<string, string> = {};
+    for (const raw of oauthParams) {
+      const eqIdx = raw.indexOf("=");
+      if (eqIdx === -1) {
+        console.error(
+          `ERROR: Invalid --oauth-param format "${raw}". Expected "key=value"`
+        );
+        process.exit(1);
+      }
+      extraParams[raw.slice(0, eqIdx)] = interpolateEnv(raw.slice(eqIdx + 1));
+    }
+
+    const flow = (
+      oauthFlow ? interpolateEnv(oauthFlow) : "authorization_code"
+    ) as OAuthFlow;
+    if (flow !== "authorization_code" && flow !== "client_credentials") {
+      console.error(
+        `ERROR: Invalid --oauth-flow "${flow}". Must be "authorization_code" or "client_credentials".`
+      );
+      process.exit(1);
+    }
+
+    oauth = {
+      clientId: interpolateEnv(oauthClientId),
+      clientSecret: interpolateEnv(oauthClientSecret),
+      tokenUrl: interpolateEnv(oauthTokenUrl),
+      authUrl: oauthAuthUrl ? interpolateEnv(oauthAuthUrl) : undefined,
+      scopes: oauthScopes
+        ? interpolateEnv(oauthScopes)
+            .split(/[,\s]+/)
+            .filter(Boolean)
+        : [],
+      flow,
+      extraParams,
+    };
+  }
+
   return {
     name,
     specs,
     baseUrl: interpolateEnv(baseUrl).replace(/\/+$/, ""),
     headers: Object.keys(headers).length > 0 ? headers : undefined,
     logPath: logPath ? resolve(logPath) : undefined,
+    oauth,
   };
 }

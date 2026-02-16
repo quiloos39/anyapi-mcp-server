@@ -107,7 +107,7 @@ function getSuggestion(status: number, endpoint?: ApiEndpoint): string {
       return msg;
     }
     case 401:
-      return "Authentication required. Provide credentials via --header (e.g. --header \"Authorization: Bearer <token>\") or per-request headers parameter.";
+      return "Authentication required. Use the auth tool to authenticate via OAuth, or provide credentials via --header (e.g. --header \"Authorization: Bearer <token>\") or per-request headers parameter.";
     case 403:
       return "Forbidden. Your credentials don't have permission for this operation. Verify your API key or token has the required scopes.";
     case 404: {

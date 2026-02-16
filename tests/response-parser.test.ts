@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseResponse } from "../src/response-parser.js";
+import { parseResponse, isNonJsonResult } from "../src/response-parser.js";
 
 describe("parseResponse", () => {
   describe("JSON", () => {
@@ -13,8 +13,9 @@ describe("parseResponse", () => {
       expect(result).toEqual({ b: 2 });
     });
 
-    it("throws on malformed JSON with json content-type", () => {
-      expect(() => parseResponse("application/json", "not json")).toThrow();
+    it("falls back to text wrapper on malformed JSON with json content-type", () => {
+      const result = parseResponse("application/json", "not json");
+      expect(result).toEqual({ _type: "text", content: "not json" });
     });
   });
 
@@ -96,6 +97,50 @@ describe("parseResponse", () => {
     it("returns text wrapper for unknown content-type", () => {
       const result = parseResponse("application/octet-stream", "binary-ish");
       expect(result).toEqual({ _type: "text", content: "binary-ish" });
+    });
+  });
+
+  describe("form-urlencoded", () => {
+    it("parses application/x-www-form-urlencoded content-type", () => {
+      const result = parseResponse(
+        "application/x-www-form-urlencoded",
+        "assoscmd=login&userid=test&token=abc123"
+      );
+      expect(result).toEqual({ assoscmd: "login", userid: "test", token: "abc123" });
+    });
+
+    it("auto-detects form-urlencoded without content-type", () => {
+      const result = parseResponse(null, "key=value&foo=bar");
+      expect(result).toEqual({ key: "value", foo: "bar" });
+    });
+
+    it("auto-detects form-urlencoded when json content-type but body is form-encoded", () => {
+      const result = parseResponse("application/json", "assoscmd=login&token=xyz");
+      expect(result).toEqual({ assoscmd: "login", token: "xyz" });
+    });
+  });
+
+  describe("isNonJsonResult", () => {
+    it("returns true for text wrapper", () => {
+      expect(isNonJsonResult({ _type: "text", content: "hello" })).toBe(true);
+    });
+
+    it("returns true for null/undefined", () => {
+      expect(isNonJsonResult(null)).toBe(true);
+      expect(isNonJsonResult(undefined)).toBe(true);
+    });
+
+    it("returns true for primitives", () => {
+      expect(isNonJsonResult("string")).toBe(true);
+      expect(isNonJsonResult(42)).toBe(true);
+    });
+
+    it("returns false for plain objects", () => {
+      expect(isNonJsonResult({ id: 1, name: "test" })).toBe(false);
+    });
+
+    it("returns false for arrays", () => {
+      expect(isNonJsonResult([1, 2, 3])).toBe(false);
     });
   });
 });

@@ -59,3 +59,29 @@ export interface ListApiResult {
   page: number;
   totalPages: number;
 }
+
+export type OAuthFlow = "authorization_code" | "client_credentials";
+
+export interface OAuthConfig {
+  clientId: string;
+  clientSecret: string;
+  authUrl?: string;
+  tokenUrl: string;
+  scopes: string[];
+  flow: OAuthFlow;
+  extraParams: Record<string, string>;
+}
+
+export interface OAuthTokens {
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt: number;
+  tokenType: string;
+  scope?: string;
+}
+
+export interface OAuthSecurityScheme {
+  authorizationUrl?: string;
+  tokenUrl?: string;
+  scopes: string[];
+}

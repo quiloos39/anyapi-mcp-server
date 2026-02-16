@@ -17,12 +17,37 @@ import {
 } from "./graphql-schema.js";
 import { ApiError, buildErrorContext } from "./error-context.js";
 import { RetryableError } from "./retry.js";
+import { isNonJsonResult } from "./response-parser.js";
+import {
+  startAuth,
+  exchangeCode,
+  awaitCallback,
+  storeTokens,
+  getTokens,
+  isTokenExpired,
+  initTokenStorage,
+} from "./oauth.js";
 
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
 const config = await loadConfig();
 initLogger(config.logPath ?? null);
 const apiIndex = new ApiIndex(config.specs);
+
+// --- OAuth: merge spec-derived security info and init token storage ---
+if (config.oauth) {
+  const schemes = apiIndex.getOAuthSchemes();
+  if (schemes.length > 0) {
+    const scheme = schemes[0];
+    if (!config.oauth.authUrl && scheme.authorizationUrl) {
+      config.oauth.authUrl = scheme.authorizationUrl;
+    }
+    if (config.oauth.scopes.length === 0 && scheme.scopes.length > 0) {
+      config.oauth.scopes = scheme.scopes;
+    }
+  }
+  initTokenStorage(config.name);
+}
 
 function formatToolError(
   error: unknown,
@@ -181,7 +206,7 @@ server.tool(
   },
   async ({ method, path, params, body, headers }) => {
     try {
-      const data = await callApi(
+      const { data, responseHeaders: respHeaders } = await callApi(
         config,
         method,
         path,
@@ -191,12 +216,26 @@ server.tool(
         "populate"
       );
 
+      // Non-JSON response — skip GraphQL layer, return raw parsed data
+      if (isNonJsonResult(data)) {
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({
+              rawResponse: data,
+              responseHeaders: respHeaders,
+              hint: "This endpoint returned a non-JSON response. The raw parsed content is shown above. " +
+                "GraphQL schema inference is not available for non-JSON responses — use the data directly.",
+            }, null, 2) },
+          ],
+        };
+      }
+
       const endpoint = apiIndex.getEndpoint(method, path);
       const bodyHash = WRITE_METHODS.has(method) && body ? computeShapeHash(body) : undefined;
       const { schema, shapeHash } = getOrBuildSchema(data, method, path, endpoint?.requestBodySchema, bodyHash);
       const sdl = schemaToSDL(schema);
 
-      const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash };
+      const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash, responseHeaders: respHeaders };
       if (bodyHash) result.bodyHash = bodyHash;
 
       if (endpoint && endpoint.parameters.length > 0) {
@@ -299,7 +338,7 @@ server.tool(
   },
   async ({ method, path, params, body, query, headers, limit, offset }) => {
     try {
-      const rawData = await callApi(
+      const { data: rawData, responseHeaders: respHeaders } = await callApi(
         config,
         method,
         path,
@@ -309,6 +348,20 @@ server.tool(
         "consume"
       );
 
+      // Non-JSON response — skip GraphQL layer, return raw parsed data
+      if (isNonJsonResult(rawData)) {
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({
+              rawResponse: rawData,
+              responseHeaders: respHeaders,
+              hint: "This endpoint returned a non-JSON response. GraphQL querying is not available. " +
+                "The raw parsed content is shown above.",
+            }, null, 2) },
+          ],
+        };
+      }
+
       const endpoint = apiIndex.getEndpoint(method, path);
       const bodyHash = WRITE_METHODS.has(method) && body ? computeShapeHash(body) : undefined;
       const { schema, shapeHash } = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema, bodyHash);
@@ -317,6 +370,7 @@ server.tool(
 
       if (typeof queryResult === "object" && queryResult !== null) {
         (queryResult as Record<string, unknown>)._shapeHash = shapeHash;
+        (queryResult as Record<string, unknown>)._responseHeaders = respHeaders;
         if (bodyHash) (queryResult as Record<string, unknown>)._bodyHash = bodyHash;
         if (truncated) {
           (queryResult as Record<string, unknown>)._meta = {
@@ -476,7 +530,7 @@ server.tool(
     try {
       const settled = await Promise.allSettled(
         requests.map(async (req) => {
-          const rawData = await callApi(
+          const { data: rawData, responseHeaders: respHeaders } = await callApi(
             config,
             req.method,
             req.path,
@@ -485,6 +539,17 @@ server.tool(
             req.headers,
             "none"
           );
+
+          // Non-JSON response — skip GraphQL layer
+          if (isNonJsonResult(rawData)) {
+            return {
+              method: req.method,
+              path: req.path,
+              data: rawData,
+              responseHeaders: respHeaders,
+              nonJson: true,
+            };
+          }
 
           const endpoint = apiIndex.getEndpoint(req.method, req.path);
           const bodyHash = WRITE_METHODS.has(req.method) && req.body
@@ -503,6 +568,7 @@ server.tool(
             method: req.method,
             path: req.path,
             data: queryResult,
+            responseHeaders: respHeaders,
             shapeHash,
             ...(bodyHash ? { bodyHash } : {}),
           };
@@ -543,6 +609,160 @@ server.tool(
     }
   }
 );
+
+// --- Tool 6: auth (only when OAuth is configured) ---
+if (config.oauth) {
+  server.tool(
+    "auth",
+    `Manage OAuth 2.0 authentication for ${config.name}. ` +
+      "Use action 'start' to begin the OAuth flow (returns an authorization URL for " +
+      "authorization_code flow, or completes token exchange for client_credentials). " +
+      "Use action 'exchange' to complete the flow — the callback is captured automatically " +
+      "via a localhost server, or you can provide a 'code' manually. " +
+      "Use action 'status' to check the current token status.",
+    {
+      action: z
+        .enum(["start", "exchange", "status"])
+        .describe(
+          "'start' begins auth flow, 'exchange' completes code exchange, 'status' shows token info"
+        ),
+      code: z
+        .string()
+        .optional()
+        .describe(
+          "Authorization code from the OAuth provider (optional for 'exchange' — " +
+            "if omitted, waits for the localhost callback automatically)"
+        ),
+    },
+    async ({ action, code }) => {
+      try {
+        if (action === "start") {
+          const result = await startAuth(config.oauth!);
+          if ("url" in result) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: JSON.stringify(
+                    {
+                      message:
+                        "Open this URL to authorize. A local callback server is listening. " +
+                        "After you approve, call auth with action 'exchange' to complete authentication.",
+                      authorizationUrl: result.url,
+                      flow: config.oauth!.flow,
+                    },
+                    null,
+                    2
+                  ),
+                },
+              ],
+            };
+          }
+          // client_credentials: tokens obtained directly
+          storeTokens(result.tokens);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    message:
+                      "Authentication successful (client_credentials flow).",
+                    tokenType: result.tokens.tokenType,
+                    expiresIn: Math.round(
+                      (result.tokens.expiresAt - Date.now()) / 1000
+                    ),
+                    scope: result.tokens.scope ?? null,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        if (action === "exchange") {
+          const tokens = code
+            ? await exchangeCode(config.oauth!, code)
+            : await awaitCallback(config.oauth!);
+          storeTokens(tokens);
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    message: "Authentication successful.",
+                    tokenType: tokens.tokenType,
+                    expiresIn: Math.round(
+                      (tokens.expiresAt - Date.now()) / 1000
+                    ),
+                    hasRefreshToken: !!tokens.refreshToken,
+                    scope: tokens.scope ?? null,
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        // action === "status"
+        const tokens = getTokens();
+        if (!tokens) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    authenticated: false,
+                    message:
+                      "No tokens stored. Use auth with action 'start' to authenticate.",
+                  },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+        const expired = isTokenExpired();
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  authenticated: true,
+                  tokenType: tokens.tokenType,
+                  expired,
+                  expiresIn: Math.round(
+                    (tokens.expiresAt - Date.now()) / 1000
+                  ),
+                  hasRefreshToken: !!tokens.refreshToken,
+                  scope: tokens.scope ?? null,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify({ error: message }) },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+}
 
 async function main() {
   const transport = new StdioServerTransport();
