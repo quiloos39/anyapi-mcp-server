@@ -23,11 +23,21 @@ function unwrapType(type: GraphQLOutputType): GraphQLOutputType {
   return type;
 }
 
+function isJsonScalar(type: GraphQLOutputType): boolean {
+  const unwrapped = unwrapType(type);
+  return isScalarType(unwrapped) && unwrapped.name === "JSON";
+}
+
+function getJsonFieldNames(type: GraphQLObjectType): string[] {
+  const fields = type.getFields();
+  return Object.keys(fields).filter((name) => isJsonScalar(fields[name].type));
+}
+
 function getScalarFieldNames(type: GraphQLObjectType): string[] {
   const fields = type.getFields();
   return Object.keys(fields).filter((name) => {
     const fieldType = unwrapType(fields[name].type);
-    return isScalarType(fieldType);
+    return isScalarType(fieldType) && fieldType.name !== "JSON";
   });
 }
 
@@ -57,12 +67,17 @@ function buildDepthLimitedQuery(
     } else if (isListType(fieldType)) {
       const elementType = unwrapType(fieldType.ofType);
       if (isScalarType(elementType)) {
-        parts.push(name);
+        // JSON scalar lists: include without limit args
+        if (elementType.name === "JSON") {
+          parts.push(name);
+        } else {
+          parts.push(`${name}(limit: 10)`);
+        }
         count++;
       } else if (isObjectType(elementType) && depth < maxDepth) {
         const nested = buildDepthLimitedQuery(elementType, maxDepth, depth + 1);
         if (nested) {
-          parts.push(`${name} ${nested}`);
+          parts.push(`${name}(limit: 10) ${nested}`);
           count++;
         }
       }
@@ -80,10 +95,10 @@ export function generateSuggestions(schema: GraphQLSchema): QuerySuggestion[] {
   const fields = queryType.getFields();
   const fieldNames = Object.keys(fields);
 
-  // Suggestion 1: All scalar fields at root
+  // Suggestion 1: All scalar fields at root (excluding JSON scalars)
   const scalarFields = fieldNames.filter((name) => {
     const type = unwrapType(fields[name].type);
-    return isScalarType(type);
+    return isScalarType(type) && type.name !== "JSON";
   });
   if (scalarFields.length > 0) {
     const selected = scalarFields.slice(0, MAX_FIELDS_PER_LEVEL);
@@ -91,6 +106,19 @@ export function generateSuggestions(schema: GraphQLSchema): QuerySuggestion[] {
       name: "All top-level scalar fields",
       query: `{ ${selected.join(" ")} }`,
       description: `Returns ${selected.join(", ")}`,
+    });
+  }
+
+  // Suggestion: Dynamic JSON fields
+  const jsonFields = getJsonFieldNames(queryType);
+  if (jsonFields.length > 0) {
+    const selected = jsonFields.slice(0, MAX_FIELDS_PER_LEVEL);
+    suggestions.push({
+      name: "Dynamic JSON fields",
+      query: `{ ${selected.join(" ")} }`,
+      description:
+        `${selected.join(", ")} contain dynamic JSON — returned as-is. ` +
+        "Use jsonFilter param to extract nested values.",
     });
   }
 
@@ -107,8 +135,8 @@ export function generateSuggestions(schema: GraphQLSchema): QuerySuggestion[] {
         if (subfields.length > 0) {
           suggestions.push({
             name: `List ${name} with basic fields`,
-            query: `{ ${name} { ${subfields.join(" ")} } }`,
-            description: `Fetches ${subfields.join(", ")} for each item in ${name}`,
+            query: `{ ${name}(limit: 10) { ${subfields.join(" ")} } }`,
+            description: `Fetches ${subfields.join(", ")} for each item in ${name} (paginated — use limit/offset args)`,
           });
         }
       }
@@ -125,8 +153,8 @@ export function generateSuggestions(schema: GraphQLSchema): QuerySuggestion[] {
         if (subfields.length > 0) {
           suggestions.push({
             name: "Items with count",
-            query: `{ items { ${subfields.join(" ")} } _count }`,
-            description: `Array response: fetches ${subfields.join(", ")} with total count`,
+            query: `{ items(limit: 10) { ${subfields.join(" ")} } _count }`,
+            description: `Array response: fetches ${subfields.join(", ")} with total count (paginated — use limit/offset args)`,
           });
         }
       }

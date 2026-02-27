@@ -9,7 +9,15 @@ export interface RequestBodyProperty {
   type: string;
   description?: string;
   required?: boolean;
-  items?: { type: string };
+  items?: { type: string; properties?: Record<string, RequestBodyProperty>; required?: string[] };
+  properties?: Record<string, RequestBodyProperty>;
+  required_fields?: string[];
+}
+
+export interface RateLimitInfo {
+  remaining: number | null;
+  limit: number | null;
+  resetAt: string | null;
 }
 
 export interface RequestBodySchema {

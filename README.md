@@ -94,7 +94,7 @@ See the [Google Workspace guide](docs/google-workspace.md) for a complete OAuth 
 
 ## Tools
 
-The server exposes five tools (plus `auth` when OAuth is configured):
+The server exposes four tools (plus `auth` when OAuth is configured):
 
 ### `list_api` — Browse endpoints
 
@@ -102,11 +102,11 @@ Discover what the API offers. Call with no arguments to see all categories, prov
 
 ### `call_api` — Inspect an endpoint
 
-Makes a real HTTP request and returns the **inferred GraphQL schema** (SDL) — not the data itself. Use this to discover the response shape and get `suggestedQueries` you can copy into `query_api`.
+Makes a real HTTP request and returns the **inferred GraphQL schema** (SDL) — not the data itself. Use this to discover the response shape and get `suggestedQueries` you can copy into `query_api`. Also returns per-field token costs (`fieldTokenCosts`) and a `dataKey` for cache reuse.
 
 ### `query_api` — Fetch data
 
-Fetches data and returns **only the fields you select** via a GraphQL query. Supports both reads and writes (mutations for POST/PUT/DELETE/PATCH).
+Fetches data and returns **only the fields you select** via a GraphQL query. Supports both reads and writes (mutations for POST/PUT/DELETE/PATCH). Pass a `dataKey` from `call_api` to reuse cached data with zero HTTP calls.
 
 ```graphql
 # Read
@@ -116,13 +116,14 @@ Fetches data and returns **only the fields you select** via a GraphQL query. Sup
 mutation { post_endpoint(input: { name: "example" }) { id } }
 ```
 
+Key parameters:
+- **`maxTokens`** — token budget for the response (default 4000). Arrays are truncated to fit.
+- **`dataKey`** — reuse cached data from a previous `call_api` or `query_api` response.
+- **`jsonFilter`** — dot-path to extract nested values after the GraphQL query (e.g. `"data[].attributes.name"`).
+
 ### `explain_api` — Read the docs
 
 Returns spec documentation for an endpoint (parameters, request body schema, response codes) **without making an HTTP request**.
-
-### `batch_query` — Parallel requests
-
-Fetches data from up to 10 endpoints concurrently in a single tool call. Each request follows the `query_api` flow.
 
 ### `auth` — OAuth authentication
 
@@ -140,11 +141,11 @@ list_api          → discover what's available
      ↓
 explain_api       → read the docs for an endpoint
      ↓
-call_api          → inspect the response schema
+call_api          → inspect the response schema (returns dataKey)
      ↓
-query_api         → fetch exactly the fields you need
+query_api         → fetch exactly the fields you need (pass dataKey for zero HTTP calls)
      ↓
-batch_query       → fetch from multiple endpoints at once
+query_api         → re-query with different fields using the same dataKey
 ```
 
 ## How it works
@@ -153,21 +154,20 @@ batch_query       → fetch from multiple endpoints at once
 OpenAPI/Postman spec
         │
         ▼
-   ┌─────────┐  ┌─────────────┐  ┌──────────┐  ┌───────────┐  ┌─────────────┐
-   │list_api │  │ explain_api │  │ call_api │  │ query_api │  │ batch_query │
-   │(browse) │  │   (docs)    │  │ (schema) │  │  (data)   │  │ (parallel)  │
-   └─────────┘  └─────────────┘  └──────────┘  └───────────┘  └─────────────┘
-        │          │ no HTTP          │               │             │
-        ▼          ▼ request          ▼               ▼             ▼
-   Spec index   Spec index     REST API call    REST API call  N concurrent
-   (tags,       (params,       (with retry      (cached if     REST API calls
-    paths)       responses,     + caching)       same as        + GraphQL
-                 body schema)       │            call_api)      execution
-                                    ▼               │
-                               Infer GraphQL        ▼
-                               schema from     Execute GraphQL
-                               JSON response   query against
-                                               response data
+   ┌─────────┐  ┌─────────────┐  ┌──────────┐  ┌───────────┐
+   │list_api │  │ explain_api │  │ call_api │  │ query_api │
+   │(browse) │  │   (docs)    │  │ (schema) │  │  (data)   │
+   └─────────┘  └─────────────┘  └──────────┘  └───────────┘
+        │          │ no HTTP          │               │
+        ▼          ▼ request          ▼               ▼
+   Spec index   Spec index     REST API call    dataKey cache
+   (tags,       (params,       (with retry)     hit → no HTTP
+    paths)       responses,         │            miss → fetch
+                 body schema)       ▼               │
+                               Infer schema +       ▼
+                               return dataKey   Execute GraphQL
+                                                + token budget
+                                                  truncation
 ```
 
 ## Features
@@ -179,10 +179,14 @@ OpenAPI/Postman spec
 - **Multi-sample merging** — samples up to 10 array elements for richer schemas
 - **Mutation support** — write operations get typed GraphQL mutations from OpenAPI body schemas
 - **Smart suggestions** — `call_api` returns ready-to-use queries based on the inferred schema
-- **Response caching** — 30s TTL prevents duplicate calls across `call_api` → `query_api`
+- **Response caching** — filesystem-based cache with 5-min TTL; `dataKey` tokens let `query_api` reuse data with zero HTTP calls
+- **Token budget** — `query_api` accepts `maxTokens` (default 4000) and truncates array results to fit via binary search
+- **Per-field token costs** — `call_api` returns a `fieldTokenCosts` tree so the LLM can make informed field selections
+- **Rate limit tracking** — parses `X-RateLimit-*` headers and warns when limits are nearly exhausted
+- **Pagination detection** — auto-detects cursor, next-page-token, and link-based pagination patterns in responses
+- **JSON filter** — `query_api` accepts a `jsonFilter` dot-path for post-query extraction (e.g. `"data[].name"`)
 - **Retry with backoff** — automatic retries for 429/5xx with exponential backoff and `Retry-After` support
 - **Multi-format** — parses JSON, XML, CSV, and plain text responses
-- **Pagination** — API-level via `params`, client-side slicing via `limit`/`offset`
 - **Rich errors** — structured error messages with status-specific suggestions and spec context for self-correction
 - **OAuth 2.0** — Authorization Code (with PKCE) and Client Credentials flows with automatic token refresh
 - **Env var interpolation** — `${ENV_VAR}` in base URLs, headers, and spec paths

@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { loadConfig } from "./config.js";
 import { ApiIndex } from "./api-index.js";
-import { callApi } from "./api-client.js";
+import { callApi, parseRateLimits } from "./api-client.js";
 import { initLogger } from "./logger.js";
 import { generateSuggestions } from "./query-suggestions.js";
 import {
@@ -14,7 +14,10 @@ import {
   schemaToSDL,
   truncateIfArray,
   computeShapeHash,
+  collectJsonFields,
+  computeFieldCosts,
 } from "./graphql-schema.js";
+import { buildStatusMessage } from "./token-budget.js";
 import { ApiError, buildErrorContext } from "./error-context.js";
 import { RetryableError } from "./retry.js";
 import { isNonJsonResult } from "./response-parser.js";
@@ -27,6 +30,9 @@ import {
   isTokenExpired,
   initTokenStorage,
 } from "./oauth.js";
+import { detectPagination, PAGINATION_PARAM_NAMES } from "./pagination.js";
+import { applyJsonFilter } from "./json-filter.js";
+import { storeResponse, loadResponse } from "./data-cache.js";
 
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
@@ -67,6 +73,23 @@ function formatToolError(
     content: [{ type: "text" as const, text: JSON.stringify({ error: message }) }],
     isError: true,
   };
+}
+
+function attachRateLimit(
+  result: Record<string, unknown>,
+  respHeaders: Record<string, string>
+): void {
+  const rl = parseRateLimits(respHeaders);
+  if (!rl) return;
+  result._rateLimit = rl;
+  if (
+    rl.remaining !== null &&
+    (rl.remaining <= 5 || (rl.limit !== null && rl.remaining / rl.limit <= 0.1))
+  ) {
+    result._rateLimitWarning =
+      `Rate limit nearly exhausted (${rl.remaining}${rl.limit !== null ? `/${rl.limit}` : ""} remaining` +
+      `${rl.resetAt ? `, resets ${rl.resetAt}` : ""}). Consider reducing request frequency.`;
+  }
 }
 
 const server = new McpServer({
@@ -175,6 +198,7 @@ server.tool(
     "For example, if the schema shows 'products: [Product]', query as '{ products { id name } }', not '{ items { id name } }'. " +
     "Also returns accepted parameters (name, location, required) from the API spec, " +
     "and suggestedQueries with ready-to-use GraphQL queries. " +
+    "Returns a dataKey — pass it to query_api to reuse the cached response (zero HTTP calls). " +
     "Use list_api first to discover endpoints.",
   {
     method: z
@@ -212,9 +236,10 @@ server.tool(
         path,
         params as Record<string, unknown> | undefined,
         body as Record<string, unknown> | undefined,
-        headers,
-        "populate"
+        headers
       );
+
+      const dataKey = storeResponse(method, path, data, respHeaders);
 
       // Non-JSON response — skip GraphQL layer, return raw parsed data
       if (isNonJsonResult(data)) {
@@ -223,6 +248,7 @@ server.tool(
             { type: "text" as const, text: JSON.stringify({
               rawResponse: data,
               responseHeaders: respHeaders,
+              dataKey,
               hint: "This endpoint returned a non-JSON response. The raw parsed content is shown above. " +
                 "GraphQL schema inference is not available for non-JSON responses — use the data directly.",
             }, null, 2) },
@@ -235,8 +261,9 @@ server.tool(
       const { schema, shapeHash } = getOrBuildSchema(data, method, path, endpoint?.requestBodySchema, bodyHash);
       const sdl = schemaToSDL(schema);
 
-      const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash, responseHeaders: respHeaders };
+      const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash, dataKey, responseHeaders: respHeaders };
       if (bodyHash) result.bodyHash = bodyHash;
+      attachRateLimit(result, respHeaders);
 
       if (endpoint && endpoint.parameters.length > 0) {
         result.parameters = endpoint.parameters.map((p) => ({
@@ -244,7 +271,14 @@ server.tool(
           in: p.in,
           required: p.required,
           ...(p.description ? { description: p.description } : {}),
+          ...(p.in === "query" && PAGINATION_PARAM_NAMES.has(p.name) ? { pagination: true } : {}),
         }));
+        const paginationParams = endpoint.parameters
+          .filter((p) => p.in === "query" && PAGINATION_PARAM_NAMES.has(p.name))
+          .map((p) => p.name);
+        if (paginationParams.length > 0) {
+          result.paginationParams = paginationParams;
+        }
       }
 
       // Smart query suggestions
@@ -253,19 +287,64 @@ server.tool(
         result.suggestedQueries = suggestions;
       }
 
+      // Per-field token costs
+      const fieldCosts = computeFieldCosts(data);
+      result.fieldTokenCosts = fieldCosts;
+
+      // Budget examples
+      const defaultBudget = 4000;
+      const allFieldsCost = fieldCosts._total;
+      if (Array.isArray(data) && data.length > 0 && fieldCosts._perItem) {
+        const perItem = fieldCosts._perItem;
+        const itemsFit = Math.floor(defaultBudget / perItem);
+        result.budgetExamples = [
+          `All fields: ~${perItem} tokens/item, ~${itemsFit} items fit in default budget (${defaultBudget})`,
+        ];
+      } else if (typeof data === "object" && data !== null) {
+        result.budgetExamples = [
+          `All fields: ~${allFieldsCost} tokens total`,
+        ];
+      }
+
+      // Flag JSON scalar fields so the AI knows which fields are opaque
+      const jsonFields = collectJsonFields(schema);
+      if (jsonFields.length > 0) {
+        result.jsonFields = jsonFields;
+        result.jsonFieldsHint =
+          "These fields contain heterogeneous or deeply nested data that cannot be queried " +
+          "with GraphQL field selection. Query them as-is and parse the returned JSON directly.";
+      }
+
+      // Pagination detection from response data
+      const pagination = detectPagination(data, endpoint?.parameters);
+      if (pagination) {
+        result._pagination = pagination;
+      }
+
+      const paginationParamsList = (result.paginationParams as string[] | undefined) ?? [];
+      const paginationSuffix = paginationParamsList.length > 0
+        ? ` This API supports pagination via: ${paginationParamsList.join(", ")}. Pass these inside params.`
+        : "";
+
       if (Array.isArray(data)) {
         result.totalItems = data.length;
         result.hint =
           "Use query_api with field names from the schema above. " +
           "For raw arrays: '{ items { ... } _count }'. " +
           "For paginated APIs, pass limit/offset inside params (as query string parameters to the API), " +
-          "NOT as top-level tool parameters.";
+          "NOT as top-level tool parameters. " +
+          "Use fieldTokenCosts to understand per-field token costs and select fields wisely. " +
+          "query_api's maxTokens parameter controls response size — select fewer fields to fit more items." +
+          paginationSuffix;
       } else {
         result.hint =
           "Use query_api with the exact root field names from the schema above (e.g. if schema shows " +
           "'products: [Product]', query as '{ products { id name } }' — do NOT use '{ items { ... } }'). " +
           "For paginated APIs, pass limit/offset inside params (as query string parameters to the API), " +
-          "NOT as top-level tool parameters.";
+          "NOT as top-level tool parameters. " +
+          "Use fieldTokenCosts to understand per-field token costs and select fields wisely. " +
+          "query_api's maxTokens parameter controls response size — select fewer fields to fit more items." +
+          paginationSuffix;
       }
 
       return {
@@ -283,14 +362,19 @@ server.tool(
 server.tool(
   "query_api",
   `Fetch data from a ${config.name} API endpoint, returning only the fields you select via GraphQL. ` +
-    "IMPORTANT: Always run call_api first to discover the actual schema field names. " +
+    "TIP: Pass the dataKey from call_api to reuse the cached response — zero HTTP calls. " +
+    "If you know the field names, call query_api directly — on first hit the schema SDL " +
+    "will be included in the response. If unsure, use call_api first for schema discovery.\n" +
     "Use the exact root field names from the schema — do NOT assume generic names.\n" +
     "- Raw array response ([...]): '{ items { id name } _count }'\n" +
     "- Object response ({products: [...]}): '{ products { id name } }' (use actual field names from schema)\n" +
     "- Write operations with mutation schema: 'mutation { post_endpoint(input: { ... }) { id name } }'\n" +
     "Field names with dashes are converted to underscores (e.g. created-at → created_at). " +
     "PAGINATION: To paginate the API itself, pass limit/offset inside 'params' (they become query string parameters). " +
-    "The top-level limit/offset parameters only slice the already-fetched response locally.",
+    "TOKEN BUDGET: Use maxTokens to control response size. If the response exceeds the budget, " +
+    "array results are truncated to fit. Select fewer fields to fit more items. " +
+    "Check _status in the response: 'COMPLETE' means all data returned, 'TRUNCATED' means array was cut to fit budget. " +
+    "Every response includes a _dataKey for subsequent re-queries with different field selections.",
   {
     method: z
       .enum(["GET", "POST", "PUT", "DELETE", "PATCH"])
@@ -316,6 +400,13 @@ server.tool(
         "GraphQL selection query using field names from call_api schema " +
           "(e.g. '{ products { id name } }' — NOT '{ items { ... } }' unless the API returns a raw array)"
       ),
+    dataKey: z
+      .string()
+      .optional()
+      .describe(
+        "dataKey from a previous call_api or query_api response. " +
+          "If valid, reuses cached data — zero HTTP calls. Falls back to HTTP on miss/expiry."
+      ),
     headers: z
       .record(z.string())
       .optional()
@@ -323,30 +414,50 @@ server.tool(
         "Additional HTTP headers for this request (e.g. { \"Authorization\": \"Bearer <token>\" }). " +
           "Overrides default --header values."
       ),
-    limit: z
-      .number()
-      .int()
-      .min(1)
+    jsonFilter: z
+      .string()
       .optional()
-      .describe("Client-side slice: max items from already-fetched response (default: 50). For API pagination, use params instead."),
-    offset: z
+      .describe(
+        "Dot-path to extract from the result after GraphQL query executes. " +
+          "Use \".\" for nested access, \"[]\" to traverse arrays. " +
+          "Example: \"data[].attributes.message\" extracts the message field from each element of the data array."
+      ),
+    maxTokens: z
       .number()
-      .int()
-      .min(0)
+      .min(100)
       .optional()
-      .describe("Client-side slice: items to skip in already-fetched response (default: 0). For API pagination, use params instead."),
+      .describe(
+        "Token budget for the response (default: 4000). If exceeded, array results are truncated to fit. " +
+          "Select fewer fields to fit more items."
+      ),
   },
-  async ({ method, path, params, body, query, headers, limit, offset }) => {
+  async ({ method, path, params, body, query, dataKey, headers, jsonFilter, maxTokens }) => {
     try {
-      const { data: rawData, responseHeaders: respHeaders } = await callApi(
-        config,
-        method,
-        path,
-        params as Record<string, unknown> | undefined,
-        body as Record<string, unknown> | undefined,
-        headers,
-        "consume"
-      );
+      const budget = maxTokens ?? 4000;
+
+      let rawData: unknown;
+      let respHeaders: Record<string, string>;
+
+      // Try dataKey cache first
+      const cached = dataKey ? loadResponse(dataKey) : null;
+      if (cached) {
+        rawData = cached.data;
+        respHeaders = cached.responseHeaders;
+      } else {
+        const result = await callApi(
+          config,
+          method,
+          path,
+          params as Record<string, unknown> | undefined,
+          body as Record<string, unknown> | undefined,
+          headers
+        );
+        rawData = result.data;
+        respHeaders = result.responseHeaders;
+      }
+
+      // Store response for future re-queries
+      const newDataKey = storeResponse(method, path, rawData, respHeaders);
 
       // Non-JSON response — skip GraphQL layer, return raw parsed data
       if (isNonJsonResult(rawData)) {
@@ -355,6 +466,7 @@ server.tool(
             { type: "text" as const, text: JSON.stringify({
               rawResponse: rawData,
               responseHeaders: respHeaders,
+              _dataKey: newDataKey,
               hint: "This endpoint returned a non-JSON response. GraphQL querying is not available. " +
                 "The raw parsed content is shown above.",
             }, null, 2) },
@@ -364,27 +476,44 @@ server.tool(
 
       const endpoint = apiIndex.getEndpoint(method, path);
       const bodyHash = WRITE_METHODS.has(method) && body ? computeShapeHash(body) : undefined;
-      const { schema, shapeHash } = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema, bodyHash);
-      const { data, truncated, total } = truncateIfArray(rawData, limit, offset);
-      const queryResult = await executeQuery(schema, data, query);
+      const { schema, shapeHash, fromCache } = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema, bodyHash);
+      let queryResult = await executeQuery(schema, rawData, query);
 
-      if (typeof queryResult === "object" && queryResult !== null) {
-        (queryResult as Record<string, unknown>)._shapeHash = shapeHash;
-        (queryResult as Record<string, unknown>)._responseHeaders = respHeaders;
-        if (bodyHash) (queryResult as Record<string, unknown>)._bodyHash = bodyHash;
-        if (truncated) {
-          (queryResult as Record<string, unknown>)._meta = {
-            total,
-            offset: offset ?? 0,
-            limit: limit ?? 50,
-            hasMore: true,
-          };
+      if (jsonFilter) {
+        queryResult = applyJsonFilter(queryResult, jsonFilter);
+      }
+
+      // Apply token budget
+      const { status, result: budgetResult } = buildStatusMessage(queryResult, budget);
+
+      if (typeof budgetResult === "object" && budgetResult !== null && !Array.isArray(budgetResult)) {
+        const qr = budgetResult as Record<string, unknown>;
+        attachRateLimit(qr, respHeaders);
+        // Include schema + suggestions on first hit so LLM learns the field names
+        if (!fromCache) {
+          qr._schema = schemaToSDL(schema);
+          const suggestions = generateSuggestions(schema);
+          if (suggestions.length > 0) {
+            qr._suggestedQueries = suggestions;
+          }
         }
+        // Pagination hint from raw response data
+        const pagination = detectPagination(rawData, endpoint?.parameters);
+        if (pagination) {
+          qr._pagination = pagination;
+        }
+        // _status as first key
+        const output = { _status: status, _dataKey: newDataKey, ...qr };
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(output, null, 2) },
+          ],
+        };
       }
 
       return {
         content: [
-          { type: "text" as const, text: JSON.stringify(queryResult, null, 2) },
+          { type: "text" as const, text: JSON.stringify({ _status: status, _dataKey: newDataKey, data: budgetResult }, null, 2) },
         ],
       };
     } catch (error: unknown) {
@@ -489,128 +618,7 @@ server.tool(
   }
 );
 
-// --- Tool 5: batch_query ---
-server.tool(
-  "batch_query",
-  `Fetch data from multiple ${config.name} API endpoints concurrently. ` +
-    "Each request in the batch follows the query_api flow — makes a real HTTP request " +
-    "and returns only the fields selected via GraphQL query. " +
-    "All requests execute in parallel; one failure does not affect the others. " +
-    "IMPORTANT: Run call_api first on each endpoint to discover schema field names.",
-  {
-    requests: z
-      .array(
-        z.object({
-          method: z
-            .enum(["GET", "POST", "PUT", "DELETE", "PATCH"])
-            .describe("HTTP method"),
-          path: z.string().describe("API path template"),
-          params: z
-            .record(z.unknown())
-            .optional()
-            .describe("Path and query parameters"),
-          body: z
-            .record(z.unknown())
-            .optional()
-            .describe("Request body for POST/PUT/PATCH"),
-          query: z
-            .string()
-            .describe("GraphQL selection query (use field names from call_api schema)"),
-          headers: z
-            .record(z.string())
-            .optional()
-            .describe("Additional HTTP headers for this request"),
-        })
-      )
-      .min(1)
-      .max(10)
-      .describe("Array of requests to execute concurrently (1-10)"),
-  },
-  async ({ requests }) => {
-    try {
-      const settled = await Promise.allSettled(
-        requests.map(async (req) => {
-          const { data: rawData, responseHeaders: respHeaders } = await callApi(
-            config,
-            req.method,
-            req.path,
-            req.params as Record<string, unknown> | undefined,
-            req.body as Record<string, unknown> | undefined,
-            req.headers,
-            "none"
-          );
-
-          // Non-JSON response — skip GraphQL layer
-          if (isNonJsonResult(rawData)) {
-            return {
-              method: req.method,
-              path: req.path,
-              data: rawData,
-              responseHeaders: respHeaders,
-              nonJson: true,
-            };
-          }
-
-          const endpoint = apiIndex.getEndpoint(req.method, req.path);
-          const bodyHash = WRITE_METHODS.has(req.method) && req.body
-            ? computeShapeHash(req.body as Record<string, unknown>)
-            : undefined;
-          const { schema, shapeHash } = getOrBuildSchema(
-            rawData,
-            req.method,
-            req.path,
-            endpoint?.requestBodySchema,
-            bodyHash
-          );
-          const queryResult = await executeQuery(schema, rawData, req.query);
-
-          return {
-            method: req.method,
-            path: req.path,
-            data: queryResult,
-            responseHeaders: respHeaders,
-            shapeHash,
-            ...(bodyHash ? { bodyHash } : {}),
-          };
-        })
-      );
-
-      const results = settled.map((outcome, i) => {
-        if (outcome.status === "fulfilled") {
-          return outcome.value;
-        }
-        const reason = outcome.reason;
-        if (reason instanceof ApiError || reason instanceof RetryableError) {
-          const endpoint = apiIndex.getEndpoint(requests[i].method, requests[i].path);
-          return buildErrorContext(reason, requests[i].method, requests[i].path, endpoint);
-        }
-        const message =
-          reason instanceof Error ? reason.message : String(reason);
-        return {
-          method: requests[i].method,
-          path: requests[i].path,
-          error: message,
-        };
-      });
-
-      return {
-        content: [
-          { type: "text" as const, text: JSON.stringify(results, null, 2) },
-        ],
-      };
-    } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [
-          { type: "text" as const, text: JSON.stringify({ error: message }) },
-        ],
-        isError: true,
-      };
-    }
-  }
-);
-
-// --- Tool 6: auth (only when OAuth is configured) ---
+// --- Tool 5: auth (only when OAuth is configured) ---
 if (config.oauth) {
   server.tool(
     "auth",

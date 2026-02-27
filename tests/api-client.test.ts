@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { callApi } from "../src/api-client.js";
+import { callApi, parseRateLimits } from "../src/api-client.js";
 import { ApiError } from "../src/error-context.js";
 import type { AnyApiConfig } from "../src/config.js";
 
@@ -125,4 +125,51 @@ describe("callApi - error handling", () => {
       .rejects.toThrow(ApiError);
   });
 
+});
+
+describe("parseRateLimits", () => {
+  it("parses x-ratelimit-* headers", () => {
+    const rl = parseRateLimits({
+      "x-ratelimit-remaining": "5",
+      "x-ratelimit-limit": "100",
+      "x-ratelimit-reset": "1700000000",
+    });
+    expect(rl).not.toBeNull();
+    expect(rl!.remaining).toBe(5);
+    expect(rl!.limit).toBe(100);
+    expect(rl!.resetAt).toMatch(/^\d{4}-/); // ISO date
+  });
+
+  it("parses ratelimit-* headers (IETF draft)", () => {
+    const rl = parseRateLimits({
+      "ratelimit-remaining": "10",
+      "ratelimit-limit": "60",
+    });
+    expect(rl).not.toBeNull();
+    expect(rl!.remaining).toBe(10);
+    expect(rl!.limit).toBe(60);
+    expect(rl!.resetAt).toBeNull();
+  });
+
+  it("parses x-rate-limit-* headers (hyphenated)", () => {
+    const rl = parseRateLimits({
+      "x-rate-limit-remaining": "0",
+      "x-rate-limit-limit": "3",
+      "x-rate-limit-reset": "30",
+    });
+    expect(rl).not.toBeNull();
+    expect(rl!.remaining).toBe(0);
+    expect(rl!.limit).toBe(3);
+    expect(rl!.resetAt).toBe("30s"); // seconds, not unix timestamp
+  });
+
+  it("returns null when no rate limit headers present", () => {
+    expect(parseRateLimits({ "content-type": "application/json" })).toBeNull();
+  });
+
+  it("handles case-insensitive headers", () => {
+    const rl = parseRateLimits({ "X-RateLimit-Remaining": "7" });
+    expect(rl).not.toBeNull();
+    expect(rl!.remaining).toBe(7);
+  });
 });

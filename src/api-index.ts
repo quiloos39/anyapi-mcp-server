@@ -64,6 +64,88 @@ interface PostmanCollection {
 }
 
 const HTTP_METHODS = new Set(["get", "post", "put", "delete", "patch"]);
+const MAX_BODY_SCHEMA_DEPTH = 6;
+
+function extractProperties(
+  schema: Record<string, unknown>,
+  spec: Record<string, unknown>,
+  depth: number,
+  visited: Set<string>
+): Record<string, RequestBodyProperty> | undefined {
+  const properties = schema.properties as Record<string, Record<string, unknown>> | undefined;
+  if (!properties) return undefined;
+
+  const requiredFields = new Set(
+    Array.isArray(schema.required) ? (schema.required as string[]) : []
+  );
+
+  const result: Record<string, RequestBodyProperty> = {};
+  for (const [propName, propDef] of Object.entries(properties)) {
+    let def = propDef;
+    let refPath: string | undefined;
+    // Resolve property-level $ref
+    if (def["$ref"] && typeof def["$ref"] === "string") {
+      refPath = def["$ref"] as string;
+      if (visited.has(refPath)) {
+        result[propName] = { type: "object", required: requiredFields.has(propName) };
+        continue;
+      }
+      const resolved = resolveRef(refPath, spec);
+      if (resolved) def = resolved as Record<string, unknown>;
+    }
+
+    const prop: RequestBodyProperty = {
+      type: (def.type as string) ?? "string",
+      required: requiredFields.has(propName),
+    };
+    if (def.description) prop.description = def.description as string;
+
+    // Recurse into nested objects
+    if (prop.type === "object" && def.properties && depth < MAX_BODY_SCHEMA_DEPTH) {
+      const branch = new Set(visited);
+      if (refPath) branch.add(refPath);
+      const nested = extractProperties(def as Record<string, unknown>, spec, depth + 1, branch);
+      if (nested) {
+        prop.properties = nested;
+        if (Array.isArray(def.required) && def.required.length > 0) {
+          prop.required_fields = def.required as string[];
+        }
+      }
+    }
+
+    if (def.items && typeof def.items === "object") {
+      let itemsDef = def.items as Record<string, unknown>;
+      let itemsRefPath: string | undefined;
+      if (itemsDef["$ref"] && typeof itemsDef["$ref"] === "string") {
+        itemsRefPath = itemsDef["$ref"] as string;
+        if (!visited.has(itemsRefPath)) {
+          const resolved = resolveRef(itemsRefPath, spec);
+          if (resolved) itemsDef = resolved as Record<string, unknown>;
+        }
+      }
+      const itemType = (itemsDef.type as string) ?? "string";
+      if (itemType === "object" && itemsDef.properties && depth < MAX_BODY_SCHEMA_DEPTH) {
+        const branch = new Set(visited);
+        if (itemsRefPath) branch.add(itemsRefPath);
+        const nestedItems = extractProperties(itemsDef, spec, depth + 1, branch);
+        if (nestedItems) {
+          prop.items = {
+            type: itemType,
+            properties: nestedItems,
+            required: Array.isArray(itemsDef.required) ? (itemsDef.required as string[]) : undefined,
+          };
+        } else {
+          prop.items = { type: itemType };
+        }
+      } else {
+        prop.items = { type: itemType };
+      }
+    }
+    result[propName] = prop;
+  }
+
+  return Object.keys(result).length > 0 ? result : undefined;
+}
 
 function extractRequestBodySchema(
   requestBody: unknown,
@@ -95,37 +177,10 @@ function extractRequestBodySchema(
     schema = resolved as Record<string, unknown>;
   }
 
-  const properties = schema.properties as Record<string, Record<string, unknown>> | undefined;
-  if (!properties) return undefined;
+  const result = extractProperties(schema, spec, 0, new Set());
+  if (!result) return undefined;
 
-  const requiredFields = new Set(
-    Array.isArray(schema.required) ? (schema.required as string[]) : []
-  );
-
-  const result: Record<string, RequestBodyProperty> = {};
-  for (const [propName, propDef] of Object.entries(properties)) {
-    let def = propDef;
-    // Resolve property-level $ref
-    if (def["$ref"] && typeof def["$ref"] === "string") {
-      const resolved = resolveRef(def["$ref"] as string, spec);
-      if (resolved) def = resolved as Record<string, unknown>;
-    }
-
-    const prop: RequestBodyProperty = {
-      type: (def.type as string) ?? "string",
-      required: requiredFields.has(propName),
-    };
-    if (def.description) prop.description = def.description as string;
-    if (def.items && typeof def.items === "object") {
-      const items = def.items as Record<string, unknown>;
-      prop.items = { type: (items.type as string) ?? "string" };
-    }
-    result[propName] = prop;
-  }
-
-  return Object.keys(result).length > 0
-    ? { contentType: "application/json", properties: result }
-    : undefined;
+  return { contentType: "application/json", properties: result };
 }
 
 function resolveRef(ref: string, spec: Record<string, unknown>): unknown | undefined {

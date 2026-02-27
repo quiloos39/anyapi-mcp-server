@@ -11,16 +11,181 @@ import {
   GraphQLNonNull,
   GraphQLOutputType,
   GraphQLInputType,
+  isObjectType,
+  isListType,
+  isScalarType,
   graphql as executeGraphQL,
   printSchema,
 } from "graphql";
 import type { GraphQLFieldConfigMap, GraphQLInputFieldConfigMap } from "graphql";
 import { createHash } from "node:crypto";
-import type { RequestBodySchema } from "./types.js";
+import type { RequestBodySchema, RequestBodyProperty } from "./types.js";
 
-const DEFAULT_ARRAY_LIMIT = 50;
-const MAX_SAMPLE_SIZE = 30;
-const MAX_INFER_DEPTH = 4;
+const MAX_ARRAY_LIMIT = 50;
+const MAX_SAMPLE_SIZE = 50;
+const MAJORITY_THRESHOLD = 0.6;
+
+/**
+ * Estimate token cost of a JSON value by walking its structure.
+ * For scalars, estimates based on string length (long strings cost more tokens).
+ * For objects, sums child costs. For arrays, averages across multiple samples (up to 10).
+ * Bounded by MAX_INFER_DEPTH to match inference behavior.
+ */
+function estimateTokenCost(value: unknown, depth: number = 0): number {
+  if (depth >= MAX_INFER_DEPTH) return 1;
+  if (value === null || value === undefined) return 1;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return 1;
+    // Average across multiple samples for better accuracy
+    const sampleCount = Math.min(value.length, 10);
+    let totalCost = 0;
+    for (let i = 0; i < sampleCount; i++) {
+      totalCost += estimateTokenCost(value[i], depth + 1);
+    }
+    return Math.max(1, Math.round(totalCost / sampleCount));
+  }
+  if (typeof value === "object") {
+    let count = 0;
+    for (const v of Object.values(value as Record<string, unknown>)) {
+      count += estimateTokenCost(v, depth + 1);
+    }
+    return Math.max(1, count);
+  }
+  // Scalars: estimate token cost from serialized JSON size.
+  // Each string in a JSON response adds ~10 chars of overhead (quotes, comma,
+  // indentation, newline), so we use the full serialized length / 4 to approximate
+  // LLM tokens (1 token ≈ 4 chars).
+  if (typeof value === "string") {
+    const jsonLen = value.length + 10; // value + overhead
+    return Math.max(1, Math.ceil(jsonLen / 4));
+  }
+  return 1;
+}
+
+/**
+ * Per-field token cost tree. Used by call_api to help LLMs understand
+ * how much budget each field consumes.
+ */
+export interface FieldCostNode {
+  _total: number;
+  _perItem?: number;
+  _avgLength?: number;
+  [field: string]: number | FieldCostNode | undefined;
+}
+
+/**
+ * Compute a per-field token cost tree from response data.
+ * Uses sanitized field names to match GraphQL schema.
+ */
+export function computeFieldCosts(data: unknown, depth: number = 0): FieldCostNode {
+  if (depth >= MAX_INFER_DEPTH || data === null || data === undefined) {
+    return { _total: 1 };
+  }
+
+  if (Array.isArray(data)) {
+    if (data.length === 0) {
+      return { _total: 1, _perItem: 0, _avgLength: 0 };
+    }
+
+    const sampleCount = Math.min(data.length, 10);
+
+    // Check if array of objects
+    const firstObj = data.find(
+      (el): el is Record<string, unknown> =>
+        typeof el === "object" && el !== null && !Array.isArray(el)
+    );
+
+    if (firstObj) {
+      // Merge samples for representative fields
+      const mergeResult = mergeArraySamples(data);
+      const representative = mergeResult ? mergeResult.merged : firstObj;
+      const itemCosts = computeFieldCosts(representative, depth + 1);
+      const perItem = itemCosts._total;
+      return {
+        _total: perItem * data.length,
+        _perItem: perItem,
+        _avgLength: data.length,
+        ...Object.fromEntries(
+          Object.entries(itemCosts).filter(([k]) => !k.startsWith("_"))
+        ),
+      };
+    }
+
+    // Scalar array
+    let totalCost = 0;
+    for (let i = 0; i < sampleCount; i++) {
+      totalCost += estimateTokenCost(data[i]);
+    }
+    const perItem = Math.max(1, Math.round(totalCost / sampleCount));
+    return {
+      _total: perItem * data.length,
+      _perItem: perItem,
+      _avgLength: data.length,
+    };
+  }
+
+  if (typeof data === "object") {
+    const obj = data as Record<string, unknown>;
+    const entries = Object.entries(obj);
+    let total = 0;
+    const result: FieldCostNode = { _total: 0 };
+
+    for (const [key, value] of entries) {
+      const sanitized = sanitizeFieldName(key);
+      if (
+        value !== null &&
+        value !== undefined &&
+        typeof value === "object"
+      ) {
+        const childCost = computeFieldCosts(value, depth + 1);
+        result[sanitized] = childCost;
+        total += childCost._total;
+      } else {
+        const cost = estimateTokenCost(value);
+        result[sanitized] = cost;
+        total += cost;
+      }
+    }
+
+    result._total = Math.max(1, total);
+    return result;
+  }
+
+  return { _total: estimateTokenCost(data) };
+}
+
+/**
+ * Compute a default array limit that scales inversely with item token cost.
+ * Simple items ([1, 2, 3], [{id, name}]) → high limit (up to 50).
+ * Complex items (deeply nested objects with many fields) → low limit (min 3).
+ * Long strings (like k8s tags, URLs) → lower limit to avoid token bloat.
+ * Aims to keep total token cost for this array around TOKEN_BUDGET.
+ *
+ * For scalar arrays, samples multiple elements to get a better average cost
+ * (first element might not be representative).
+ */
+function dynamicArrayLimit(arr: unknown[]): number {
+  if (arr.length === 0) return MAX_ARRAY_LIMIT;
+  const mergeResult = mergeArraySamples(arr);
+
+  let costPerItem: number;
+  if (mergeResult) {
+    costPerItem = estimateTokenCost(mergeResult.merged);
+  } else {
+    // Scalar array: sample up to 10 elements for average cost
+    const sampleCount = Math.min(arr.length, 10);
+    let totalCost = 0;
+    for (let i = 0; i < sampleCount; i++) {
+      totalCost += estimateTokenCost(arr[i]);
+    }
+    costPerItem = totalCost / sampleCount;
+  }
+
+  const TOKEN_BUDGET = 200;
+  const MIN_ITEMS = 3;
+  return Math.max(MIN_ITEMS, Math.min(MAX_ARRAY_LIMIT, Math.floor(TOKEN_BUDGET / costPerItem)));
+}
+const MAX_INFER_DEPTH = 8;
 
 /**
  * Custom scalar that passes arbitrary JSON values through as-is.
@@ -50,7 +215,7 @@ export function truncateIfArray(
   }
   const total = data.length;
   const off = offset ?? 0;
-  const lim = limit ?? DEFAULT_ARRAY_LIMIT;
+  const lim = limit ?? MAX_ARRAY_LIMIT;
   const sliced = data.slice(off, off + lim);
   return { data: sliced, truncated: sliced.length < total, total };
 }
@@ -132,14 +297,19 @@ interface MergeResult {
 
 /**
  * Merge multiple sample objects into a single "super-object" that contains
- * every key seen across all samples. First non-null value wins for each key.
+ * every key seen across all samples.
+ * Uses majority-type conflict resolution: if one base type accounts for >=60%
+ * of observations for a field, that type wins. Otherwise the field is marked
+ * as a conflict (JSON scalar fallback).
  * Nested objects are merged recursively.
- * Tracks fields where different samples have conflicting base types.
  */
 function mergeSamples(items: Record<string, unknown>[]): MergeResult {
   const merged: Record<string, unknown> = {};
   const conflicts = new Set<string>();
-  const seenTypes = new Map<string, string>(); // key → first base type
+  // key → (baseType → count) for majority-type resolution
+  const typeCounts = new Map<string, Map<string, number>>();
+  // key → (baseType → first value of that type) for setting merged to winning type's value
+  const firstValueByType = new Map<string, Map<string, unknown>>();
 
   for (const item of items) {
     for (const [key, value] of Object.entries(item)) {
@@ -147,32 +317,56 @@ function mergeSamples(items: Record<string, unknown>[]): MergeResult {
 
       const valueType = baseTypeOf(value);
 
+      // Track type counts
+      if (!typeCounts.has(key)) typeCounts.set(key, new Map());
+      const counts = typeCounts.get(key)!;
+      counts.set(valueType, (counts.get(valueType) ?? 0) + 1);
+
+      // Track first value per type
+      if (!firstValueByType.has(key)) firstValueByType.set(key, new Map());
+      const typeValues = firstValueByType.get(key)!;
+      if (!typeValues.has(valueType)) typeValues.set(valueType, value);
+
       if (!(key in merged) || merged[key] === null || merged[key] === undefined) {
         merged[key] = value;
-        if (!seenTypes.has(key)) seenTypes.set(key, valueType);
-      } else {
-        const prevType = seenTypes.get(key);
-        if (prevType && prevType !== valueType) {
-          conflicts.add(key);
-        }
-
-        if (
-          !conflicts.has(key) &&
-          typeof value === "object" && value !== null && !Array.isArray(value) &&
-          typeof merged[key] === "object" && merged[key] !== null && !Array.isArray(merged[key])
-        ) {
-          const sub = mergeSamples([
-            merged[key] as Record<string, unknown>,
-            value as Record<string, unknown>,
-          ]);
-          merged[key] = sub.merged;
-          for (const c of sub.conflicts) conflicts.add(`${key}.${c}`);
-        } else if (Array.isArray(value) && Array.isArray(merged[key])) {
-          if ((merged[key] as unknown[]).length === 0 && value.length > 0) {
-            merged[key] = value;
-          }
+      } else if (
+        typeof value === "object" && value !== null && !Array.isArray(value) &&
+        typeof merged[key] === "object" && merged[key] !== null && !Array.isArray(merged[key])
+      ) {
+        const sub = mergeSamples([
+          merged[key] as Record<string, unknown>,
+          value as Record<string, unknown>,
+        ]);
+        merged[key] = sub.merged;
+        for (const c of sub.conflicts) conflicts.add(`${key}.${c}`);
+      } else if (Array.isArray(value) && Array.isArray(merged[key])) {
+        if ((merged[key] as unknown[]).length === 0 && value.length > 0) {
+          merged[key] = value;
         }
       }
+    }
+  }
+
+  // Apply majority-type resolution
+  for (const [key, counts] of typeCounts) {
+    if (counts.size <= 1) continue; // single type → no conflict
+
+    const total = Array.from(counts.values()).reduce((a, b) => a + b, 0);
+    let majorityType: string | null = null;
+    for (const [type, count] of counts) {
+      if (count / total >= MAJORITY_THRESHOLD) {
+        majorityType = type;
+        break;
+      }
+    }
+
+    if (majorityType) {
+      // Majority type wins — set merged value to a representative of the winning type
+      const winningValue = firstValueByType.get(key)!.get(majorityType);
+      merged[key] = winningValue;
+    } else {
+      // No majority → mark as conflict
+      conflicts.add(key);
     }
   }
 
@@ -267,7 +461,7 @@ function inferType(
 
   if (Array.isArray(value)) {
     if (value.length === 0) {
-      return new GraphQLList(GraphQLString);
+      return new GraphQLList(GraphQLJSON);
     }
     // Mixed-type arrays → JSON scalar (e.g. ["field", 4296, { "temporal-unit": "day" }])
     if (hasMixedTypes(value)) {
@@ -317,20 +511,25 @@ function inferType(
 
     for (const [originalKey, fieldValue] of entries) {
       let sanitized = sanitizeFieldName(originalKey);
+      let wasCollision = false;
 
       if (usedNames.has(sanitized)) {
         let counter = 2;
         while (usedNames.has(`${sanitized}_${counter}`)) counter++;
         sanitized = `${sanitized}_${counter}`;
+        wasCollision = true;
       }
       usedNames.add(sanitized);
 
       const key = originalKey;
+      const needsDescription = wasCollision || sanitized !== originalKey;
+      const description = needsDescription ? `Original API field: "${originalKey}"` : undefined;
 
       // Use JSON scalar for fields with type conflicts across samples
       if (conflicts?.has(originalKey)) {
         fieldConfigs[sanitized] = {
           type: GraphQLJSON,
+          ...(description ? { description } : {}),
           resolve: (source: Record<string, unknown>) => source[key],
         };
         continue;
@@ -339,10 +538,31 @@ function inferType(
       const childTypeName = `${typeName}_${sanitized}`;
       const fieldType = inferType(fieldValue, childTypeName, typeRegistry, conflicts, depth + 1);
 
-      fieldConfigs[sanitized] = {
-        type: fieldType,
-        resolve: (source: Record<string, unknown>) => source[key],
-      };
+      if (fieldType instanceof GraphQLList) {
+        const arrDefault = Array.isArray(fieldValue) ? dynamicArrayLimit(fieldValue) : MAX_ARRAY_LIMIT;
+        fieldConfigs[sanitized] = {
+          type: fieldType,
+          ...(description ? { description } : {}),
+          args: {
+            limit: { type: GraphQLInt, defaultValue: arrDefault },
+            offset: { type: GraphQLInt, defaultValue: 0 },
+          },
+          resolve: (
+            source: Record<string, unknown>,
+            args: { limit: number; offset: number }
+          ) => {
+            const val = source[key];
+            if (!Array.isArray(val)) return val;
+            return val.slice(args.offset, args.offset + args.limit);
+          },
+        };
+      } else {
+        fieldConfigs[sanitized] = {
+          type: fieldType,
+          ...(description ? { description } : {}),
+          resolve: (source: Record<string, unknown>) => source[key],
+        };
+      }
     }
 
     const realType = new GraphQLObjectType({
@@ -374,6 +594,70 @@ function mapOpenApiTypeToGraphQLInput(type: string): GraphQLInputType {
   }
 }
 
+const MAX_INPUT_DEPTH = 6;
+
+/**
+ * Build a GraphQL input type from a RequestBodyProperty definition.
+ * Recursively creates GraphQLInputObjectType for nested objects and
+ * GraphQLList(GraphQLInputObjectType) for arrays with object items.
+ */
+function buildInputType(
+  propDef: RequestBodyProperty,
+  parentTypeName: string,
+  propName: string,
+  depth: number
+): GraphQLInputType {
+  if (depth >= MAX_INPUT_DEPTH) return GraphQLString;
+
+  if (propDef.type === "object" && propDef.properties) {
+    const nestedFields: GraphQLInputFieldConfigMap = {};
+    const reqFields = new Set(propDef.required_fields ?? []);
+    for (const [name, nested] of Object.entries(propDef.properties)) {
+      const sanitized = sanitizeFieldName(name);
+      let type = buildInputType(nested, `${parentTypeName}_${sanitizeFieldName(propName)}`, name, depth + 1);
+      if (nested.required || reqFields.has(name)) {
+        type = new GraphQLNonNull(type);
+      }
+      nestedFields[sanitized] = {
+        type,
+        ...(nested.description ? { description: nested.description } : {}),
+      };
+    }
+    if (Object.keys(nestedFields).length === 0) return GraphQLString;
+    return new GraphQLInputObjectType({
+      name: `${parentTypeName}_${sanitizeFieldName(propName)}`,
+      fields: nestedFields,
+    });
+  }
+
+  if (propDef.type === "array" && propDef.items) {
+    if (propDef.items.properties) {
+      const itemFields: GraphQLInputFieldConfigMap = {};
+      const reqFields = new Set(propDef.items.required ?? []);
+      for (const [name, nested] of Object.entries(propDef.items.properties)) {
+        const sanitized = sanitizeFieldName(name);
+        let type = buildInputType(nested, `${parentTypeName}_${sanitizeFieldName(propName)}_Item`, name, depth + 1);
+        if (nested.required || reqFields.has(name)) {
+          type = new GraphQLNonNull(type);
+        }
+        itemFields[sanitized] = {
+          type,
+          ...(nested.description ? { description: nested.description } : {}),
+        };
+      }
+      if (Object.keys(itemFields).length > 0) {
+        return new GraphQLList(new GraphQLInputObjectType({
+          name: `${parentTypeName}_${sanitizeFieldName(propName)}_Item`,
+          fields: itemFields,
+        }));
+      }
+    }
+    return new GraphQLList(mapOpenApiTypeToGraphQLInput(propDef.items.type));
+  }
+
+  return mapOpenApiTypeToGraphQLInput(propDef.type);
+}
+
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
 /**
@@ -397,7 +681,7 @@ export function buildSchemaFromData(
 
   // Array response
   if (Array.isArray(data)) {
-    let itemType: GraphQLOutputType = GraphQLString;
+    let itemType: GraphQLOutputType = GraphQLJSON;
     if (data.length > 0) {
       // Mixed-type top-level array → items are JSON scalars
       if (hasMixedTypes(data)) {
@@ -415,12 +699,24 @@ export function buildSchemaFromData(
       }
     }
 
+    const topLimit = dynamicArrayLimit(data as unknown[]);
     queryType = new GraphQLObjectType({
       name: "Query",
       fields: {
         items: {
           type: new GraphQLList(itemType),
-          resolve: (source: unknown) => source as unknown[],
+          args: {
+            limit: { type: GraphQLInt, defaultValue: topLimit },
+            offset: { type: GraphQLInt, defaultValue: 0 },
+          },
+          resolve: (
+            source: unknown,
+            args: { limit: number; offset: number }
+          ) => {
+            const arr = source as unknown[];
+            if (!Array.isArray(arr)) return arr;
+            return arr.slice(args.offset, args.offset + args.limit);
+          },
         },
         _count: {
           type: GraphQLInt,
@@ -445,6 +741,10 @@ export function buildSchemaFromData(
         for (const [fieldName, fieldDef] of Object.entries(originalFields)) {
           queryFields[fieldName] = {
             type: fieldDef.type,
+            ...(fieldDef.description ? { description: fieldDef.description } : {}),
+            args: fieldDef.args.length > 0
+              ? Object.fromEntries(fieldDef.args.map(a => [a.name, { type: a.type, defaultValue: a.defaultValue }]))
+              : undefined,
             resolve: fieldDef.resolve,
           };
         }
@@ -472,7 +772,7 @@ export function buildSchemaFromData(
     const inputFields: GraphQLInputFieldConfigMap = {};
     for (const [propName, propDef] of Object.entries(requestBodySchema.properties)) {
       const sanitized = sanitizeFieldName(propName);
-      let type: GraphQLInputType = mapOpenApiTypeToGraphQLInput(propDef.type);
+      let type: GraphQLInputType = buildInputType(propDef, `${baseName}_Input`, propName, 0);
       if (propDef.required) {
         type = new GraphQLNonNull(type);
       }
@@ -521,16 +821,16 @@ export function getOrBuildSchema(
   pathTemplate: string,
   requestBodySchema?: RequestBodySchema,
   cacheHash?: string
-): { schema: GraphQLSchema; shapeHash: string } {
+): { schema: GraphQLSchema; shapeHash: string; fromCache: boolean } {
   const shapeHash = computeShapeHash(data);
   const effectiveHash = cacheHash ?? shapeHash;
   const key = cacheKey(method, pathTemplate, effectiveHash);
   const cached = schemaCache.get(key);
-  if (cached) return { schema: cached, shapeHash };
+  if (cached) return { schema: cached, shapeHash, fromCache: true };
 
   const schema = buildSchemaFromData(data, method, pathTemplate, requestBodySchema);
   schemaCache.set(key, schema);
-  return { schema, shapeHash };
+  return { schema, shapeHash, fromCache: false };
 }
 
 /**
@@ -538,6 +838,44 @@ export function getOrBuildSchema(
  */
 export function schemaToSDL(schema: GraphQLSchema): string {
   return printSchema(schema);
+}
+
+/**
+ * Walk the schema type tree and return field paths typed as the JSON scalar.
+ * Helps callers understand which fields are opaque and can't be queried with
+ * GraphQL field selection.
+ */
+export function collectJsonFields(schema: GraphQLSchema): string[] {
+  const jsonFields: string[] = [];
+  const queryType = schema.getQueryType();
+  if (!queryType) return jsonFields;
+  const visited = new Set<string>();
+
+  function walk(type: GraphQLObjectType, prefix: string) {
+    if (visited.has(type.name)) return;
+    visited.add(type.name);
+    for (const [name, field] of Object.entries(type.getFields())) {
+      let unwrapped = field.type;
+      if (unwrapped instanceof GraphQLNonNull) unwrapped = unwrapped.ofType;
+      const path = prefix ? `${prefix}.${name}` : name;
+      if (isScalarType(unwrapped) && unwrapped.name === "JSON") {
+        jsonFields.push(path);
+      } else if (isObjectType(unwrapped)) {
+        walk(unwrapped, path);
+      } else if (isListType(unwrapped)) {
+        let inner = unwrapped.ofType;
+        if (inner instanceof GraphQLNonNull) inner = inner.ofType;
+        if (isScalarType(inner) && inner.name === "JSON") {
+          jsonFields.push(path);
+        } else if (isObjectType(inner)) {
+          walk(inner, path);
+        }
+      }
+    }
+  }
+
+  walk(queryType, "");
+  return jsonFields;
 }
 
 /**

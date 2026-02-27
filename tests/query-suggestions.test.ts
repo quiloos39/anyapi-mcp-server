@@ -138,3 +138,56 @@ describe("generateSuggestions", () => {
     expect(mutation!.query).not.toContain("(input:");
   });
 });
+
+describe("generateSuggestions - JSON scalar handling", () => {
+  it("excludes JSON fields from 'All top-level scalar fields' suggestion", () => {
+    // mixed-type array → inferred as JSON scalar
+    const data = { id: 1, name: "test", dynamic: ["string", 42, true] };
+    const schema = buildSchemaFromData(data, "GET", "/test/json-suggest-1");
+    const suggestions = generateSuggestions(schema);
+
+    const scalarSuggestion = suggestions.find(
+      (s) => s.name === "All top-level scalar fields"
+    );
+    expect(scalarSuggestion).toBeDefined();
+    expect(scalarSuggestion!.query).toContain("id");
+    expect(scalarSuggestion!.query).toContain("name");
+    expect(scalarSuggestion!.query).not.toContain("dynamic");
+  });
+
+  it("generates 'Dynamic JSON fields' suggestion when JSON fields exist", () => {
+    const data = { id: 1, attrs: ["string", 42, true] };
+    const schema = buildSchemaFromData(data, "GET", "/test/json-suggest-2");
+    const suggestions = generateSuggestions(schema);
+
+    const jsonSuggestion = suggestions.find(
+      (s) => s.name === "Dynamic JSON fields"
+    );
+    expect(jsonSuggestion).toBeDefined();
+    expect(jsonSuggestion!.query).toContain("attrs");
+    expect(jsonSuggestion!.description).toContain("dynamic JSON");
+    expect(jsonSuggestion!.description).toContain("jsonFilter");
+  });
+
+  it("no 'Dynamic JSON fields' suggestion when no JSON fields", () => {
+    const data = { id: 1, name: "test" };
+    const schema = buildSchemaFromData(data, "GET", "/test/json-suggest-3");
+    const suggestions = generateSuggestions(schema);
+
+    const jsonSuggestion = suggestions.find(
+      (s) => s.name === "Dynamic JSON fields"
+    );
+    expect(jsonSuggestion).toBeUndefined();
+  });
+
+  it("depth-limited query does not add (limit: 10) to JSON scalar lists", () => {
+    // mixed array inside an object → JSON scalar
+    const data = { id: 1, blob: { a: 1, b: "str", c: [1, "two"] } };
+    const schema = buildSchemaFromData(data, "GET", "/test/json-suggest-5");
+    const suggestions = generateSuggestions(schema);
+    const depth2 = suggestions.find((s) => s.name === "Full query (depth 2)");
+    expect(depth2).toBeDefined();
+    // "c" is a JSON scalar, should not have (limit: 10)
+    expect(depth2!.query).not.toMatch(/c\(limit:/);
+  });
+});

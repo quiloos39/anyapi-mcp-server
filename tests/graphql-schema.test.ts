@@ -6,7 +6,10 @@ import {
   schemaToSDL,
   executeQuery,
   computeShapeHash,
+  collectJsonFields,
+  computeFieldCosts,
 } from "../src/graphql-schema.js";
+import type { FieldCostNode } from "../src/graphql-schema.js";
 
 describe("truncateIfArray", () => {
   it("returns non-array data unchanged", () => {
@@ -419,6 +422,111 @@ describe("mutation execution", () => {
   });
 });
 
+describe("buildSchemaFromData - nested mutation input types", () => {
+  const nestedBodySchema = {
+    contentType: "application/json" as const,
+    properties: {
+      filter: {
+        type: "object",
+        required: false,
+        properties: {
+          query: { type: "string", required: false, description: "Search query" },
+          from: { type: "string", required: false },
+          to: { type: "string", required: false },
+        },
+        required_fields: ["query"],
+      },
+      page: {
+        type: "object",
+        required: false,
+        properties: {
+          cursor: { type: "string", required: false },
+          limit: { type: "integer", required: false },
+        },
+      },
+      sort: { type: "string", required: false },
+    },
+  };
+
+  it("creates nested input types for object properties", () => {
+    const data = { data: [] };
+    const schema = buildSchemaFromData(data, "POST", "/test/nested-input", nestedBodySchema);
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("input POST_test_nested_input_Input_filter");
+    expect(sdl).toContain("query: String!");
+    expect(sdl).toContain("from: String");
+    expect(sdl).toContain("to: String");
+  });
+
+  it("creates separate input type for each nested object", () => {
+    const data = { data: [] };
+    const schema = buildSchemaFromData(data, "POST", "/test/nested-sep", nestedBodySchema);
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("input POST_test_nested_sep_Input_filter");
+    expect(sdl).toContain("input POST_test_nested_sep_Input_page");
+    expect(sdl).toContain("cursor: String");
+    expect(sdl).toContain("limit: Int");
+  });
+
+  it("keeps scalar properties as leaf types", () => {
+    const data = {};
+    const schema = buildSchemaFromData(data, "POST", "/test/nested-leaf", nestedBodySchema);
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("sort: String");
+  });
+
+  it("handles array-of-objects input type", () => {
+    const arrayBodySchema = {
+      contentType: "application/json" as const,
+      properties: {
+        requests: {
+          type: "array",
+          required: false,
+          items: {
+            type: "object",
+            properties: {
+              method: { type: "string", required: true },
+              url: { type: "string", required: true },
+            },
+            required: ["method", "url"],
+          },
+        },
+      },
+    };
+    const data = {};
+    const schema = buildSchemaFromData(data, "POST", "/test/arr-obj-input", arrayBodySchema);
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("requests: [POST_test_arr_obj_input_Input_requests_Item]");
+    expect(sdl).toContain("method: String!");
+    expect(sdl).toContain("url: String!");
+  });
+
+  it("falls back to String at depth limit", () => {
+    // Build a 7-level nested body schema (exceeds MAX_INPUT_DEPTH = 6)
+    let innermost: Record<string, { type: string; required: boolean; properties?: Record<string, unknown> }> = {
+      value: { type: "string", required: false },
+    };
+    for (let i = 0; i < 7; i++) {
+      innermost = {
+        nested: {
+          type: "object",
+          required: false,
+          properties: innermost as unknown as Record<string, unknown>,
+        } as unknown as typeof innermost["nested"],
+      };
+    }
+    const deepSchema = {
+      contentType: "application/json" as const,
+      properties: innermost as unknown as Record<string, import("../src/types.js").RequestBodyProperty>,
+    };
+    const data = {};
+    const schema = buildSchemaFromData(data, "POST", "/test/deep-input", deepSchema);
+    const sdl = schemaToSDL(schema);
+    // At some depth it should fall back to String instead of creating more input types
+    expect(sdl).toContain("String");
+  });
+});
+
 describe("schemaToSDL", () => {
   it("returns valid SDL string", () => {
     const schema = buildSchemaFromData({ id: 1, name: "test" }, "GET", "/test/sdl");
@@ -457,5 +565,405 @@ describe("executeQuery", () => {
     await expect(executeQuery(schema, data, "{ nonexistent }")).rejects.toThrow(
       "GraphQL query error"
     );
+  });
+});
+
+describe("recursive array pagination", () => {
+  it("caps nested arrays at default limit (50)", async () => {
+    const data = {
+      products: Array.from({ length: 3 }, (_, i) => ({
+        id: i,
+        tags: Array.from({ length: 100 }, (_, j) => `tag-${j}`),
+      })),
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/nested-cap");
+    const result = await executeQuery(schema, data, "{ products { id tags } }");
+    const products = (result as Record<string, unknown[]>).products as Array<{ id: number; tags: string[] }>;
+    expect(products).toHaveLength(3);
+    for (const p of products) {
+      expect(p.tags).toHaveLength(50);
+    }
+  });
+
+  it("supports limit arg on nested list fields", async () => {
+    const data = {
+      products: Array.from({ length: 5 }, (_, i) => ({
+        id: i,
+        tags: Array.from({ length: 20 }, (_, j) => `tag-${j}`),
+      })),
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/nested-limit");
+    const result = await executeQuery(schema, data, "{ products(limit: 2) { id tags(limit: 3) } }");
+    const products = (result as Record<string, unknown[]>).products as Array<{ id: number; tags: string[] }>;
+    expect(products).toHaveLength(2);
+    for (const p of products) {
+      expect(p.tags).toHaveLength(3);
+    }
+  });
+
+  it("supports offset arg on nested list fields", async () => {
+    const data = {
+      items: Array.from({ length: 10 }, (_, i) => ({ id: i })),
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/nested-offset");
+    const result = await executeQuery(schema, data, "{ items(limit: 3, offset: 5) { id } }");
+    const items = (result as Record<string, unknown[]>).items as Array<{ id: number }>;
+    expect(items).toEqual([{ id: 5 }, { id: 6 }, { id: 7 }]);
+  });
+
+  it("caps arrays at multiple nesting levels independently", async () => {
+    const data = {
+      users: Array.from({ length: 60 }, (_, i) => ({
+        id: i,
+        tags: Array.from({ length: 80 }, (_, k) => `tag-${k}`),
+      })),
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/deep-cap");
+    const sdl = schemaToSDL(schema);
+    // Extract the dynamic limits from SDL
+    const usersMatch = sdl.match(/users\(limit: Int = (\d+)/);
+    const tagsMatch = sdl.match(/tags\(limit: Int = (\d+)/);
+    const usersLimit = parseInt(usersMatch![1], 10);
+    const tagsLimit = parseInt(tagsMatch![1], 10);
+    expect(usersLimit).toBeLessThanOrEqual(50);
+    expect(tagsLimit).toBeLessThanOrEqual(50);
+
+    const result = await executeQuery(
+      schema, data,
+      "{ users { id tags } }"
+    );
+    const users = (result as Record<string, unknown[]>).users as Array<{
+      id: number;
+      tags: string[];
+    }>;
+    expect(users).toHaveLength(usersLimit); // capped by dynamic limit
+    for (const user of users) {
+      expect(user.tags).toHaveLength(tagsLimit); // capped by dynamic limit
+    }
+  });
+
+  it("does not truncate arrays under the default limit", async () => {
+    const data = {
+      users: Array.from({ length: 5 }, (_, i) => ({ id: i })),
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/no-cap");
+    const result = await executeQuery(schema, data, "{ users { id } }");
+    expect((result as Record<string, unknown[]>).users).toHaveLength(5);
+  });
+
+  it("caps top-level array items with default limit", async () => {
+    const data = Array.from({ length: 100 }, (_, i) => ({ id: i }));
+    const schema = buildSchemaFromData(data, "GET", "/test/top-array-cap");
+    const result = await executeQuery(schema, data, "{ items { id } _count }");
+    const r = result as { items: Array<{ id: number }>; _count: number };
+    expect(r.items).toHaveLength(50);
+    expect(r._count).toBe(100); // _count reflects original size
+  });
+
+  it("supports limit/offset on top-level array items", async () => {
+    const data = Array.from({ length: 20 }, (_, i) => ({ id: i }));
+    const schema = buildSchemaFromData(data, "GET", "/test/top-array-paginate");
+    const result = await executeQuery(schema, data, "{ items(limit: 3, offset: 5) { id } _count }");
+    const r = result as { items: Array<{ id: number }>; _count: number };
+    expect(r.items).toEqual([{ id: 5 }, { id: 6 }, { id: 7 }]);
+    expect(r._count).toBe(20);
+  });
+
+  it("SDL includes limit/offset args on list fields", () => {
+    const data = { tags: ["a", "b"] };
+    const schema = buildSchemaFromData(data, "GET", "/test/sdl-args");
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("tags(limit: Int = 50, offset: Int = 0)");
+  });
+
+  it("uses lower default limit for complex array items", async () => {
+    const complexItem = {
+      id: 1, type: "log",
+      attributes: {
+        message: "hello", status: "info", service: "web",
+        host: "i-abc", timestamp: "2024-01-01",
+        http: { method: "GET", url: "/api", status_code: 200 },
+        user: { id: "u1", name: "Alice", email: "a@b.com" },
+        geo: { country: "US", city: "NYC", lat: 40.7, lng: -74.0 },
+      },
+    };
+    // ~18 leaf fields → limit should be well below 50
+    const data = Array.from({ length: 100 }, () => ({ ...complexItem }));
+    const schema = buildSchemaFromData(data, "GET", "/test/dynamic-limit");
+    const sdl = schemaToSDL(schema);
+    const match = sdl.match(/items\(limit: Int = (\d+)/);
+    expect(match).not.toBeNull();
+    const limit = parseInt(match![1], 10);
+    expect(limit).toBeLessThan(50);
+    expect(limit).toBeGreaterThanOrEqual(3);
+
+    // Verify the limit is actually applied in execution
+    const result = await executeQuery(schema, data, "{ items { id } _count }");
+    const r = result as { items: unknown[]; _count: number };
+    expect(r.items).toHaveLength(limit);
+    expect(r._count).toBe(100);
+  });
+
+  it("keeps high limit for very simple array items", () => {
+    // Items with only tiny scalars should get a high limit
+    const data = Array.from({ length: 100 }, (_, i) => ({ id: i }));
+    const schema = buildSchemaFromData(data, "GET", "/test/simple-limit");
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("items(limit: Int = 50");
+  });
+
+  it("uses lower limit for long-string arrays (like k8s tags)", async () => {
+    // Simulate Datadog-style tags: 30 strings averaging ~60 chars
+    const tags = Array.from({ length: 30 }, (_, i) =>
+      `kube_container_name:my-production-storefront-${i}-with-long-suffix`
+    );
+    const data = { tags };
+    const schema = buildSchemaFromData(data, "GET", "/test/long-tags");
+    const sdl = schemaToSDL(schema);
+    const match = sdl.match(/tags\(limit: Int = (\d+)/);
+    expect(match).not.toBeNull();
+    const limit = parseInt(match![1], 10);
+    // Long strings (~65 chars each ≈ 19 tokens) should get a much lower limit than 50
+    expect(limit).toBeLessThan(15);
+    expect(limit).toBeGreaterThanOrEqual(3);
+
+    // Verify the limit is enforced
+    const result = await executeQuery(schema, data, "{ tags }") as { tags: string[] };
+    expect(result.tags).toHaveLength(limit);
+  });
+});
+
+describe("deep inference (MAX_INFER_DEPTH = 8)", () => {
+  it("infers typed fields at depth 6", async () => {
+    const data = {
+      a: { b: { c: { d: { e: { f: { value: 42 } } } } } },
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/deep6");
+    const result = await executeQuery(
+      schema, data,
+      "{ a { b { c { d { e { f { value } } } } } } }"
+    );
+    expect(result).toEqual({ a: { b: { c: { d: { e: { f: { value: 42 } } } } } } });
+  });
+
+  it("falls back to JSON at depth 9", () => {
+    // Build a 9-level deep object
+    let obj: Record<string, unknown> = { leaf: "hello" };
+    for (let i = 0; i < 9; i++) {
+      obj = { nested: obj };
+    }
+    const schema = buildSchemaFromData(obj, "GET", "/test/deep9");
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("JSON");
+  });
+
+  it("merges heterogeneous array items with partially overlapping keys", async () => {
+    const data = [
+      { id: 1, name: "a", tags: ["x"] },
+      { id: 2, score: 99.5 },
+      { id: 3, name: "c", active: true },
+    ];
+    const schema = buildSchemaFromData(data, "GET", "/test/hetero-merge");
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("id");
+    expect(sdl).toContain("name");
+    expect(sdl).toContain("score");
+    expect(sdl).toContain("active");
+    expect(sdl).toContain("tags");
+  });
+});
+
+describe("getOrBuildSchema - fromCache flag", () => {
+  it("returns fromCache: false on first build", () => {
+    const data = { id: 1 };
+    const r = getOrBuildSchema(data, "GET", "/test/from-cache-flag-1");
+    expect(r.fromCache).toBe(false);
+  });
+
+  it("returns fromCache: true on cache hit", () => {
+    const data = { id: 1 };
+    getOrBuildSchema(data, "GET", "/test/from-cache-flag-2");
+    const r2 = getOrBuildSchema(data, "GET", "/test/from-cache-flag-2");
+    expect(r2.fromCache).toBe(true);
+  });
+});
+
+describe("field description on sanitized/colliding names", () => {
+  it("sanitized field gets description with original name", () => {
+    const data = { "my-field": "value", normal: "ok" };
+    const schema = buildSchemaFromData(data, "GET", "/test/desc-sanitized");
+    const sdl = schemaToSDL(schema);
+    // SDL should include a description for the sanitized field
+    expect(sdl).toContain('Original API field: "my-field"');
+    expect(sdl).toContain("my_field: String");
+    // "normal" field should NOT have a description
+    expect(sdl).not.toContain('Original API field: "normal"');
+  });
+
+  it("collision between my-field and my_field gives _2 suffix + description", () => {
+    const data = { "my-field": "a", "my_field": "b" };
+    const schema = buildSchemaFromData(data, "GET", "/test/desc-collision");
+    const sdl = schemaToSDL(schema);
+    // Both get sanitized to my_field, second should get _2 suffix
+    expect(sdl).toContain("my_field_2");
+    // The colliding field should have a description
+    expect(sdl).toContain("Original API field");
+  });
+
+  it("non-sanitized field gets no description", () => {
+    const data = { name: "test", age: 30 };
+    const schema = buildSchemaFromData(data, "GET", "/test/desc-no-desc");
+    const sdl = schemaToSDL(schema);
+    expect(sdl).not.toContain("Original API field");
+  });
+});
+
+describe("collectJsonFields", () => {
+  it("returns empty array when no JSON fields", () => {
+    const schema = buildSchemaFromData({ id: 1, name: "test" }, "GET", "/test/no-json");
+    expect(collectJsonFields(schema)).toEqual([]);
+  });
+
+  it("identifies mixed-type array fields as JSON", () => {
+    const schema = buildSchemaFromData(
+      { id: 1, mixed: ["string", 42, true] },
+      "GET",
+      "/test/json-mixed"
+    );
+    const fields = collectJsonFields(schema);
+    expect(fields).toContain("mixed");
+  });
+
+  it("identifies deeply nested JSON fields with path", () => {
+    // Create data deep enough to trigger JSON fallback (depth >= 8)
+    let obj: Record<string, unknown> = { leaf: "hello" };
+    for (let i = 0; i < 8; i++) {
+      obj = { nested: obj };
+    }
+    const data = { wrapper: obj };
+    const schema = buildSchemaFromData(data, "GET", "/test/json-deep");
+    const fields = collectJsonFields(schema);
+    expect(fields.length).toBeGreaterThan(0);
+    // The deepest reachable nested field should be in the list
+    expect(fields.some(f => f.includes("nested"))).toBe(true);
+  });
+});
+
+describe("majority-type conflict resolution", () => {
+  it("8 string + 2 number → infers String, not JSON", () => {
+    const data = Array.from({ length: 10 }, (_, i) => ({
+      id: i,
+      value: i < 8 ? `text-${i}` : i * 100,
+    }));
+    const schema = buildSchemaFromData(data, "GET", "/test/majority-str");
+    const sdl = schemaToSDL(schema);
+    // 'value' should be String, not JSON
+    expect(sdl).toContain("value: String");
+    expect(sdl).not.toContain("value: JSON");
+  });
+
+  it("3 string + 3 number + 4 object → no majority → JSON", () => {
+    const data = [
+      ...Array.from({ length: 3 }, (_, i) => ({ id: i, value: `text-${i}` })),
+      ...Array.from({ length: 3 }, (_, i) => ({ id: i + 3, value: i * 100 })),
+      ...Array.from({ length: 4 }, (_, i) => ({ id: i + 6, value: { nested: i } })),
+    ];
+    const schema = buildSchemaFromData(data, "GET", "/test/majority-none");
+    const sdl = schemaToSDL(schema);
+    // 'value' should be JSON since no type reaches 60%
+    expect(sdl).toContain("value: JSON");
+  });
+
+  it("7 number + 3 string → infers numeric type, not JSON", async () => {
+    const data = Array.from({ length: 10 }, (_, i) => ({
+      id: i,
+      score: i < 7 ? (i + 1) * 1.5 : `high-${i}`,
+    }));
+    const schema = buildSchemaFromData(data, "GET", "/test/majority-num");
+    const sdl = schemaToSDL(schema);
+    // 'score' should be Float, not JSON
+    expect(sdl).toContain("score: Float");
+    expect(sdl).not.toContain("score: JSON");
+  });
+
+  it("single-type fields unaffected", () => {
+    const data = Array.from({ length: 10 }, (_, i) => ({
+      id: i,
+      name: `item-${i}`,
+    }));
+    const schema = buildSchemaFromData(data, "GET", "/test/majority-single");
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("name: String");
+    expect(sdl).not.toContain("JSON");
+  });
+});
+
+describe("computeFieldCosts", () => {
+  it("flat object: per-field costs sum to _total", () => {
+    const data = { id: 1, name: "Alice", active: true };
+    const costs = computeFieldCosts(data);
+    expect(costs._total).toBeGreaterThan(0);
+    const fieldSum = (costs.id as number) + (costs.name as number) + (costs.active as number);
+    expect(costs._total).toBe(fieldSum);
+  });
+
+  it("array of objects: has _perItem, _avgLength, _total", () => {
+    const data = [
+      { id: 1, name: "Alice" },
+      { id: 2, name: "Bob" },
+      { id: 3, name: "Charlie" },
+    ];
+    const costs = computeFieldCosts(data);
+    expect(costs._perItem).toBeGreaterThan(0);
+    expect(costs._avgLength).toBe(3);
+    expect(costs._total).toBe(costs._perItem! * 3);
+  });
+
+  it("nested objects: recursive tree structure", () => {
+    const data = { user: { name: "Alice", address: { city: "NYC" } } };
+    const costs = computeFieldCosts(data);
+    expect(costs._total).toBeGreaterThan(0);
+    const userCosts = costs.user as FieldCostNode;
+    expect(userCosts).toBeDefined();
+    expect(userCosts._total).toBeGreaterThan(0);
+    const addressCosts = userCosts.address as FieldCostNode;
+    expect(addressCosts).toBeDefined();
+    expect(addressCosts._total).toBeGreaterThan(0);
+  });
+
+  it("empty array: _perItem=0, _avgLength=0", () => {
+    const costs = computeFieldCosts([]);
+    expect(costs._perItem).toBe(0);
+    expect(costs._avgLength).toBe(0);
+  });
+
+  it("null/undefined: _total=1", () => {
+    expect(computeFieldCosts(null)._total).toBe(1);
+    expect(computeFieldCosts(undefined)._total).toBe(1);
+  });
+
+  it("scalar arrays: _perItem, _avgLength", () => {
+    const data = ["hello", "world", "test"];
+    const costs = computeFieldCosts(data);
+    expect(costs._perItem).toBeGreaterThan(0);
+    expect(costs._avgLength).toBe(3);
+  });
+
+  it("multi-sample averaging accuracy (varying string lengths)", () => {
+    const data = [
+      { id: 1, text: "short" },
+      { id: 2, text: "a much longer string that takes more tokens" },
+    ];
+    const costs = computeFieldCosts(data);
+    expect(costs._perItem).toBeGreaterThan(0);
+    // Cost should reflect the average, not just the first item
+    expect(costs._total).toBe(costs._perItem! * 2);
+  });
+
+  it("uses sanitized field names", () => {
+    const data = { "my-field": "value", "another.field": 42 };
+    const costs = computeFieldCosts(data);
+    expect(costs.my_field).toBeDefined();
+    expect(costs.another_field).toBeDefined();
   });
 });

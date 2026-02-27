@@ -451,6 +451,213 @@ describe("Multiple specs", () => {
   });
 });
 
+// Datadog-style spec with nested request body schemas
+const OPENAPI_NESTED_BODY = JSON.stringify({
+  openapi: "3.0.0",
+  info: { title: "Datadog-style API", version: "1.0" },
+  components: {
+    schemas: {
+      LogsQueryFilter: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          from: { type: "string", description: "Start time" },
+          to: { type: "string", description: "End time" },
+          indexes: { type: "array", items: { type: "string" } },
+        },
+      },
+      LogsListRequestPage: {
+        type: "object",
+        properties: {
+          cursor: { type: "string", description: "Pagination cursor" },
+          limit: { type: "integer", description: "Max results" },
+        },
+      },
+      LogsListRequest: {
+        type: "object",
+        required: ["filter"],
+        properties: {
+          filter: { $ref: "#/components/schemas/LogsQueryFilter" },
+          page: { $ref: "#/components/schemas/LogsListRequestPage" },
+          sort: { type: "string" },
+        },
+      },
+    },
+  },
+  paths: {
+    "/api/v2/logs/events/search": {
+      post: {
+        summary: "Search logs",
+        tags: ["logs"],
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/LogsListRequest" },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+
+const OPENAPI_CIRCULAR_REF = JSON.stringify({
+  openapi: "3.0.0",
+  info: { title: "Circular API", version: "1.0" },
+  components: {
+    schemas: {
+      TreeNode: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+          children: {
+            type: "array",
+            items: { $ref: "#/components/schemas/TreeNode" },
+          },
+          parent: { $ref: "#/components/schemas/TreeNode" },
+        },
+      },
+    },
+  },
+  paths: {
+    "/tree": {
+      post: {
+        summary: "Create tree node",
+        tags: ["tree"],
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/TreeNode" },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+
+const OPENAPI_ARRAY_OBJECT_ITEMS = JSON.stringify({
+  openapi: "3.0.0",
+  info: { title: "Array Items API", version: "1.0" },
+  components: {
+    schemas: {
+      BatchRequest: {
+        type: "object",
+        properties: {
+          requests: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["method", "url"],
+              properties: {
+                method: { type: "string" },
+                url: { type: "string" },
+                body: { type: "string" },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+  paths: {
+    "/batch": {
+      post: {
+        summary: "Batch request",
+        tags: ["batch"],
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/BatchRequest" },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+
+describe("Nested request body schema extraction", () => {
+  it("extracts nested object properties via $ref", () => {
+    const index = new ApiIndex([OPENAPI_NESTED_BODY]);
+    const ep = index.getEndpoint("POST", "/api/v2/logs/events/search");
+    expect(ep!.requestBodySchema).toBeDefined();
+    const props = ep!.requestBodySchema!.properties;
+
+    // filter should have nested properties
+    expect(props.filter.type).toBe("object");
+    expect(props.filter.properties).toBeDefined();
+    expect(props.filter.properties!.query.type).toBe("string");
+    expect(props.filter.properties!.from.type).toBe("string");
+    expect(props.filter.properties!.to.type).toBe("string");
+    expect(props.filter.properties!.indexes.type).toBe("array");
+    expect(props.filter.properties!.indexes.items!.type).toBe("string");
+  });
+
+  it("extracts page sub-fields via $ref", () => {
+    const index = new ApiIndex([OPENAPI_NESTED_BODY]);
+    const ep = index.getEndpoint("POST", "/api/v2/logs/events/search");
+    const props = ep!.requestBodySchema!.properties;
+
+    expect(props.page.type).toBe("object");
+    expect(props.page.properties).toBeDefined();
+    expect(props.page.properties!.cursor.type).toBe("string");
+    expect(props.page.properties!.limit.type).toBe("integer");
+  });
+
+  it("flat properties remain flat", () => {
+    const index = new ApiIndex([OPENAPI_NESTED_BODY]);
+    const ep = index.getEndpoint("POST", "/api/v2/logs/events/search");
+    const props = ep!.requestBodySchema!.properties;
+
+    expect(props.sort.type).toBe("string");
+    expect(props.sort.properties).toBeUndefined();
+  });
+
+  it("marks required fields at top level", () => {
+    const index = new ApiIndex([OPENAPI_NESTED_BODY]);
+    const ep = index.getEndpoint("POST", "/api/v2/logs/events/search");
+    const props = ep!.requestBodySchema!.properties;
+
+    expect(props.filter.required).toBe(true);
+    expect(props.page.required).toBe(false);
+    expect(props.sort.required).toBe(false);
+  });
+
+  it("handles circular $ref without crashing", () => {
+    const index = new ApiIndex([OPENAPI_CIRCULAR_REF]);
+    const ep = index.getEndpoint("POST", "/tree");
+    expect(ep!.requestBodySchema).toBeDefined();
+    const props = ep!.requestBodySchema!.properties;
+
+    expect(props.name.type).toBe("string");
+    // parent is a circular ref — should terminate as a flat object
+    expect(props.parent.type).toBe("object");
+  });
+
+  it("extracts array items with object properties", () => {
+    const index = new ApiIndex([OPENAPI_ARRAY_OBJECT_ITEMS]);
+    const ep = index.getEndpoint("POST", "/batch");
+    expect(ep!.requestBodySchema).toBeDefined();
+    const props = ep!.requestBodySchema!.properties;
+
+    expect(props.requests.type).toBe("array");
+    expect(props.requests.items).toBeDefined();
+    expect(props.requests.items!.type).toBe("object");
+    expect(props.requests.items!.properties).toBeDefined();
+    expect(props.requests.items!.properties!.method.type).toBe("string");
+    expect(props.requests.items!.properties!.url.type).toBe("string");
+    expect(props.requests.items!.properties!.body.type).toBe("string");
+  });
+
+  it("extracts required fields for array item objects", () => {
+    const index = new ApiIndex([OPENAPI_ARRAY_OBJECT_ITEMS]);
+    const ep = index.getEndpoint("POST", "/batch");
+    const items = ep!.requestBodySchema!.properties.requests.items!;
+    expect(items.required).toEqual(["method", "url"]);
+  });
+});
+
 describe("getOAuthSchemes - OpenAPI 3.x", () => {
   it("extracts OAuth2 authorizationCode flow", () => {
     const spec = JSON.stringify({

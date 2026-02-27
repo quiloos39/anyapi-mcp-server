@@ -1,14 +1,61 @@
 import type { AnyApiConfig } from "./config.js";
+import type { RateLimitInfo } from "./types.js";
 import { withRetry, RetryableError, isRetryableStatus } from "./retry.js";
-import { buildCacheKey, consumeCached, setCache } from "./response-cache.js";
 import { logEntry, isLoggingEnabled } from "./logger.js";
 import { parseResponse } from "./response-parser.js";
 import { ApiError } from "./error-context.js";
 import { getValidAccessToken, refreshTokens } from "./oauth.js";
+import { waitIfNeeded, trackRateLimit } from "./rate-limit-tracker.js";
 
 export interface ApiResult {
   data: unknown;
   responseHeaders: Record<string, string>;
+}
+
+function tryParseInt(val: string | undefined): number | null {
+  if (!val) return null;
+  const n = parseInt(val, 10);
+  return isNaN(n) ? null : n;
+}
+
+export function parseRateLimits(
+  headers: Record<string, string>
+): RateLimitInfo | null {
+  const lower: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    lower[k.toLowerCase()] = v;
+  }
+
+  const remaining =
+    tryParseInt(lower["x-ratelimit-remaining"]) ??
+    tryParseInt(lower["ratelimit-remaining"]) ??
+    tryParseInt(lower["x-rate-limit-remaining"]);
+
+  const limit =
+    tryParseInt(lower["x-ratelimit-limit"]) ??
+    tryParseInt(lower["ratelimit-limit"]) ??
+    tryParseInt(lower["x-rate-limit-limit"]);
+
+  const resetRaw =
+    lower["x-ratelimit-reset"] ??
+    lower["ratelimit-reset"] ??
+    lower["x-rate-limit-reset"];
+
+  if (remaining === null && limit === null && !resetRaw) return null;
+
+  let resetAt: string | null = null;
+  if (resetRaw) {
+    const asNumber = parseInt(resetRaw, 10);
+    if (!isNaN(asNumber)) {
+      resetAt = asNumber > 1_000_000_000
+        ? new Date(asNumber * 1000).toISOString()
+        : `${asNumber}s`;
+    } else {
+      resetAt = resetRaw;
+    }
+  }
+
+  return { remaining, limit, resetAt };
 }
 
 const TIMEOUT_MS = 30_000;
@@ -29,30 +76,14 @@ function interpolatePath(
   return { url, remainingParams: remaining };
 }
 
-/**
- * @param cacheMode
- *   - "populate" — skip cache read, always fetch, store result (used by call_api)
- *   - "consume"  — read-and-evict cache, fetch on miss, do NOT re-store (used by query_api)
- *   - "none"     — no caching at all (default)
- */
 export async function callApi(
   config: AnyApiConfig,
   method: string,
   pathTemplate: string,
   params?: Record<string, unknown>,
   body?: Record<string, unknown>,
-  extraHeaders?: Record<string, string>,
-  cacheMode: "populate" | "consume" | "none" = "none"
+  extraHeaders?: Record<string, string>
 ): Promise<ApiResult> {
-  // --- Cache check (consume mode only) ---
-  const cacheKey = cacheMode !== "none"
-    ? buildCacheKey(method, pathTemplate, params, body, extraHeaders)
-    : "";
-  if (cacheMode === "consume") {
-    const cached = consumeCached(cacheKey) as ApiResult | undefined;
-    if (cached !== undefined) return cached;
-  }
-
   // --- URL construction ---
   const { url: interpolatedPath, remainingParams } = interpolatePath(
     pathTemplate,
@@ -132,6 +163,9 @@ export async function callApi(
           });
         }
 
+        // Track rate limit headers from every response
+        trackRateLimit(parseRateLimits(responseHeaders));
+
         if (!response.ok) {
           if (isRetryableStatus(response.status)) {
             const msg = `API error ${response.status} ${response.statusText}: ${bodyText}`;
@@ -167,6 +201,9 @@ export async function callApi(
     });
   };
 
+  // --- Rate limit pre-check ---
+  await waitIfNeeded();
+
   // --- Execute with 401 refresh-and-retry ---
   let result: ApiResult;
   try {
@@ -190,9 +227,5 @@ export async function callApi(
     }
   }
 
-  // --- Cache store (populate mode only) ---
-  if (cacheMode === "populate") {
-    setCache(cacheKey, result);
-  }
   return result;
 }
