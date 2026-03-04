@@ -33,6 +33,9 @@ import {
 import { detectPagination, PAGINATION_PARAM_NAMES } from "./pagination.js";
 import { applyJsonFilter } from "./json-filter.js";
 import { storeResponse, loadResponse } from "./data-cache.js";
+import { resolveBody } from "./body-file.js";
+import { detectPlaceholders } from "./body-validation.js";
+import { createBackup } from "./pre-write-backup.js";
 
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
@@ -220,6 +223,13 @@ server.tool(
       .record(z.unknown())
       .optional()
       .describe("Request body for POST/PUT/PATCH"),
+    bodyFile: z
+      .string()
+      .optional()
+      .describe(
+        "Absolute path to a JSON file to use as request body. " +
+          "Mutually exclusive with 'body'. Use for large payloads that cannot be inlined."
+      ),
     headers: z
       .record(z.string())
       .optional()
@@ -227,15 +237,61 @@ server.tool(
         "Additional HTTP headers for this request (e.g. { \"Authorization\": \"Bearer <token>\" }). " +
           "Overrides default --header values."
       ),
+    skipBackup: z
+      .boolean()
+      .optional()
+      .describe(
+        "Skip the automatic pre-write backup for PUT/PATCH requests. " +
+          "Default: false (backup is created automatically)."
+      ),
   },
-  async ({ method, path, params, body, headers }) => {
+  async ({ method, path, params, body, bodyFile, headers, skipBackup }) => {
     try {
+      // Resolve body from inline or file
+      let resolvedBody: Record<string, unknown> | undefined;
+      try {
+        resolvedBody = resolveBody(body as Record<string, unknown> | undefined, bodyFile);
+      } catch (err) {
+        return formatToolError(err);
+      }
+
+      // Placeholder detection for write methods (except DELETE)
+      if (resolvedBody && WRITE_METHODS.has(method) && method !== "DELETE") {
+        const endpoint = apiIndex.getEndpoint(method, path);
+        const warnings = detectPlaceholders(resolvedBody, endpoint?.requestBodySchema);
+        if (warnings.length > 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "Potential placeholder values detected in request body",
+                warnings,
+                hint: "The request was blocked to prevent sending placeholder data. " +
+                  "If the body is too large to send inline, use the 'bodyFile' parameter " +
+                  "with an absolute path to a JSON file containing the real content.",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+      }
+
+      // Pre-write backup for PUT/PATCH
+      let backupDataKey: string | undefined;
+      if ((method === "PATCH" || method === "PUT") && !skipBackup) {
+        backupDataKey = await createBackup(
+          config, method, path,
+          params as Record<string, unknown> | undefined,
+          headers
+        );
+      }
+
       const { data, responseHeaders: respHeaders } = await callApi(
         config,
         method,
         path,
         params as Record<string, unknown> | undefined,
-        body as Record<string, unknown> | undefined,
+        resolvedBody,
         headers
       );
 
@@ -257,12 +313,16 @@ server.tool(
       }
 
       const endpoint = apiIndex.getEndpoint(method, path);
-      const bodyHash = WRITE_METHODS.has(method) && body ? computeShapeHash(body) : undefined;
+      const bodyHash = WRITE_METHODS.has(method) && resolvedBody ? computeShapeHash(resolvedBody) : undefined;
       const { schema, shapeHash } = getOrBuildSchema(data, method, path, endpoint?.requestBodySchema, bodyHash);
       const sdl = schemaToSDL(schema);
 
       const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash, dataKey, responseHeaders: respHeaders };
       if (bodyHash) result.bodyHash = bodyHash;
+      if (backupDataKey) {
+        result.backupDataKey = backupDataKey;
+        result.backupHint = "Pre-write snapshot stored. Use query_api with this dataKey to retrieve original data if needed.";
+      }
       attachRateLimit(result, respHeaders);
 
       if (endpoint && endpoint.parameters.length > 0) {
@@ -394,6 +454,13 @@ server.tool(
       .record(z.unknown())
       .optional()
       .describe("Request body for POST/PUT/PATCH"),
+    bodyFile: z
+      .string()
+      .optional()
+      .describe(
+        "Absolute path to a JSON file to use as request body. " +
+          "Mutually exclusive with 'body'. Use for large payloads that cannot be inlined."
+      ),
     query: z
       .string()
       .describe(
@@ -430,13 +497,50 @@ server.tool(
         "Token budget for the response (default: 4000). If exceeded, array results are truncated to fit. " +
           "Select fewer fields to fit more items."
       ),
+    skipBackup: z
+      .boolean()
+      .optional()
+      .describe(
+        "Skip the automatic pre-write backup for PUT/PATCH requests. " +
+          "Default: false (backup is created automatically)."
+      ),
   },
-  async ({ method, path, params, body, query, dataKey, headers, jsonFilter, maxTokens }) => {
+  async ({ method, path, params, body, bodyFile, query, dataKey, headers, jsonFilter, maxTokens, skipBackup }) => {
     try {
       const budget = maxTokens ?? 4000;
 
+      // Resolve body from inline or file
+      let resolvedBody: Record<string, unknown> | undefined;
+      try {
+        resolvedBody = resolveBody(body as Record<string, unknown> | undefined, bodyFile);
+      } catch (err) {
+        return formatToolError(err);
+      }
+
+      // Placeholder detection for write methods (except DELETE)
+      if (resolvedBody && WRITE_METHODS.has(method) && method !== "DELETE") {
+        const endpoint = apiIndex.getEndpoint(method, path);
+        const warnings = detectPlaceholders(resolvedBody, endpoint?.requestBodySchema);
+        if (warnings.length > 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: "Potential placeholder values detected in request body",
+                warnings,
+                hint: "The request was blocked to prevent sending placeholder data. " +
+                  "If the body is too large to send inline, use the 'bodyFile' parameter " +
+                  "with an absolute path to a JSON file containing the real content.",
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+      }
+
       let rawData: unknown;
       let respHeaders: Record<string, string>;
+      let backupDataKey: string | undefined;
 
       // Try dataKey cache first
       const cached = dataKey ? loadResponse(dataKey) : null;
@@ -444,12 +548,21 @@ server.tool(
         rawData = cached.data;
         respHeaders = cached.responseHeaders;
       } else {
+        // Pre-write backup for PUT/PATCH
+        if ((method === "PATCH" || method === "PUT") && !skipBackup) {
+          backupDataKey = await createBackup(
+            config, method, path,
+            params as Record<string, unknown> | undefined,
+            headers
+          );
+        }
+
         const result = await callApi(
           config,
           method,
           path,
           params as Record<string, unknown> | undefined,
-          body as Record<string, unknown> | undefined,
+          resolvedBody,
           headers
         );
         rawData = result.data;
@@ -475,7 +588,7 @@ server.tool(
       }
 
       const endpoint = apiIndex.getEndpoint(method, path);
-      const bodyHash = WRITE_METHODS.has(method) && body ? computeShapeHash(body) : undefined;
+      const bodyHash = WRITE_METHODS.has(method) && resolvedBody ? computeShapeHash(resolvedBody) : undefined;
       const { schema, shapeHash, fromCache } = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema, bodyHash);
       let queryResult = await executeQuery(schema, rawData, query);
 
@@ -483,8 +596,11 @@ server.tool(
         queryResult = applyJsonFilter(queryResult, jsonFilter);
       }
 
-      // Apply token budget
-      const { status, result: budgetResult } = buildStatusMessage(queryResult, budget);
+      // Apply token budget (skip for write operations — mutation responses shouldn't be truncated)
+      const isWrite = WRITE_METHODS.has(method);
+      const { status, result: budgetResult } = isWrite
+        ? { status: "COMPLETE", result: queryResult }
+        : buildStatusMessage(queryResult, budget);
 
       if (typeof budgetResult === "object" && budgetResult !== null && !Array.isArray(budgetResult)) {
         const qr = budgetResult as Record<string, unknown>;
@@ -503,7 +619,11 @@ server.tool(
           qr._pagination = pagination;
         }
         // _status as first key
-        const output = { _status: status, _dataKey: newDataKey, ...qr };
+        const output: Record<string, unknown> = { _status: status, _dataKey: newDataKey, ...qr };
+        if (backupDataKey) {
+          output._backupDataKey = backupDataKey;
+          output._backupHint = "Pre-write snapshot stored. Use query_api with this dataKey to retrieve original data if needed.";
+        }
         return {
           content: [
             { type: "text" as const, text: JSON.stringify(output, null, 2) },
@@ -511,9 +631,14 @@ server.tool(
         };
       }
 
+      const output: Record<string, unknown> = { _status: status, _dataKey: newDataKey, data: budgetResult };
+      if (backupDataKey) {
+        output._backupDataKey = backupDataKey;
+        output._backupHint = "Pre-write snapshot stored. Use query_api with this dataKey to retrieve original data if needed.";
+      }
       return {
         content: [
-          { type: "text" as const, text: JSON.stringify({ _status: status, _dataKey: newDataKey, data: budgetResult }, null, 2) },
+          { type: "text" as const, text: JSON.stringify(output, null, 2) },
         ],
       };
     } catch (error: unknown) {

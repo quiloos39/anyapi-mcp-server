@@ -102,7 +102,7 @@ Discover what the API offers. Call with no arguments to see all categories, prov
 
 ### `call_api` — Inspect an endpoint
 
-Makes a real HTTP request and returns the **inferred GraphQL schema** (SDL) — not the data itself. Use this to discover the response shape and get `suggestedQueries` you can copy into `query_api`. Also returns per-field token costs (`fieldTokenCosts`) and a `dataKey` for cache reuse.
+Makes a real HTTP request and returns the **inferred GraphQL schema** (SDL) — not the data itself. Use this to discover the response shape and get `suggestedQueries` you can copy into `query_api`. Also returns per-field token costs (`fieldTokenCosts`) and a `dataKey` for cache reuse. For PUT/PATCH requests, automatically creates a pre-write backup (returns `backupDataKey`). Supports `bodyFile` for large payloads and blocks requests with detected placeholder values.
 
 ### `query_api` — Fetch data
 
@@ -120,6 +120,8 @@ Key parameters:
 - **`maxTokens`** — token budget for the response (default 4000). Arrays are truncated to fit.
 - **`dataKey`** — reuse cached data from a previous `call_api` or `query_api` response.
 - **`jsonFilter`** — dot-path to extract nested values after the GraphQL query (e.g. `"data[].attributes.name"`).
+- **`bodyFile`** — absolute path to a JSON file to use as request body (mutually exclusive with `body`). Use for large payloads that can't be sent inline.
+- **`skipBackup`** — skip the automatic pre-write backup for PUT/PATCH requests (default: `false`).
 
 ### `explain_api` — Read the docs
 
@@ -187,6 +189,8 @@ OpenAPI/Postman spec
 - **JSON filter** — `query_api` accepts a `jsonFilter` dot-path for post-query extraction (e.g. `"data[].name"`)
 - **Retry with backoff** — automatic retries for 429/5xx with exponential backoff and `Retry-After` support
 - **Multi-format** — parses JSON, XML, CSV, and plain text responses
+- **Safe writes** — PUT/PATCH requests automatically snapshot the resource before writing (`backupDataKey`); placeholder values (e.g. `PLACEHOLDER`, `TODO`, `file://`) are detected and blocked before sending
+- **File-based body** — `bodyFile` parameter accepts an absolute path to a JSON file, enabling large payloads that can't be sent inline
 - **Rich errors** — structured error messages with status-specific suggestions and spec context for self-correction
 - **OAuth 2.0** — Authorization Code (with PKCE) and Client Credentials flows with automatic token refresh
 - **Env var interpolation** — `${ENV_VAR}` in base URLs, headers, and spec paths
