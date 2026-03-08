@@ -14,7 +14,12 @@ import {
   isObjectType,
   isListType,
   isScalarType,
-  graphql as executeGraphQL,
+  parse,
+  validate,
+  execute,
+  specifiedRules,
+  FieldsOnCorrectTypeRule,
+  ScalarLeafsRule,
   printSchema,
 } from "graphql";
 import type { GraphQLFieldConfigMap, GraphQLInputFieldConfigMap } from "graphql";
@@ -24,6 +29,15 @@ import type { RequestBodySchema, RequestBodyProperty } from "./types.js";
 const MAX_ARRAY_LIMIT = 50;
 const MAX_SAMPLE_SIZE = 50;
 const MAJORITY_THRESHOLD = 0.6;
+
+/**
+ * Validation rules that skip FieldsOnCorrectTypeRule and ScalarLeafsRule.
+ * This allows queries to select subfields on empty arrays (inferred as [JSON])
+ * and unknown fields (which silently resolve to undefined/omitted).
+ */
+const lenientRules = specifiedRules.filter(
+  (rule) => rule !== FieldsOnCorrectTypeRule && rule !== ScalarLeafsRule
+);
 
 /**
  * Estimate token cost of a JSON value by walking its structure.
@@ -894,11 +908,15 @@ export async function executeQuery(
       ? trimmed
       : `{ ${trimmed} }`;
 
-  const result = await executeGraphQL({
-    schema,
-    source: fullQuery,
-    rootValue: data,
-  });
+  const document = parse(fullQuery);
+
+  const validationErrors = validate(schema, document, lenientRules);
+  if (validationErrors.length > 0) {
+    const messages = validationErrors.map((e) => e.message).join("; ");
+    throw new Error(`GraphQL query error: ${messages}`);
+  }
+
+  const result = await execute({ schema, document, rootValue: data });
 
   if (result.errors && result.errors.length > 0) {
     const messages = result.errors.map((e) => e.message).join("; ");

@@ -559,12 +559,38 @@ describe("executeQuery", () => {
     expect(result).toEqual({ id: 1 });
   });
 
-  it("throws on invalid query", async () => {
+  it("returns empty object for unknown fields (lenient validation)", async () => {
     const data = { id: 1 };
     const schema = buildSchemaFromData(data, "GET", "/test/exec-invalid");
-    await expect(executeQuery(schema, data, "{ nonexistent }")).rejects.toThrow(
-      "GraphQL query error"
-    );
+    const result = await executeQuery(schema, data, "{ nonexistent }");
+    expect(result).toEqual({});
+  });
+
+  it("throws on syntax errors", async () => {
+    const data = { id: 1 };
+    const schema = buildSchemaFromData(data, "GET", "/test/exec-syntax");
+    await expect(executeQuery(schema, data, "{ id { }")).rejects.toThrow();
+  });
+
+  it("returns empty array when querying subfields on empty array", async () => {
+    const data = { items: [] as unknown[] };
+    const schema = buildSchemaFromData(data, "GET", "/test/exec-empty-array");
+    const result = await executeQuery(schema, data, "{ items { sha message } }");
+    expect(result).toEqual({ items: [] });
+  });
+
+  it("omits unknown fields from result without error", async () => {
+    const data = { id: 1, name: "test" };
+    const schema = buildSchemaFromData(data, "GET", "/test/exec-unknown-fields");
+    const result = await executeQuery(schema, data, "{ id name doesNotExist }");
+    expect(result).toEqual({ id: 1, name: "test" });
+  });
+
+  it("handles nested empty arrays", async () => {
+    const data = { messages: { total: 5, matches: [] as unknown[] } };
+    const schema = buildSchemaFromData(data, "GET", "/test/exec-nested-empty");
+    const result = await executeQuery(schema, data, "{ messages { total matches { text } } }");
+    expect(result).toEqual({ messages: { total: 5, matches: [] } });
   });
 });
 
