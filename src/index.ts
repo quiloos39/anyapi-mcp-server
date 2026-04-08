@@ -16,8 +16,9 @@ import {
   computeShapeHash,
   collectJsonFields,
   computeFieldCosts,
+  collectArrayLengths,
 } from "./graphql-schema.js";
-import { buildStatusMessage } from "./token-budget.js";
+import { buildStatusMessage, estimateResultTokens, findPrimaryArrayLength } from "./token-budget.js";
 import { ApiError, buildErrorContext } from "./error-context.js";
 import { RetryableError } from "./retry.js";
 import { isNonJsonResult } from "./response-parser.js";
@@ -36,6 +37,7 @@ import { storeResponse, loadResponse } from "./data-cache.js";
 import { resolveBody } from "./body-file.js";
 import { detectPlaceholders } from "./body-validation.js";
 import { createBackup } from "./pre-write-backup.js";
+import { detectArrayShrinkage } from "./write-safety.js";
 
 const WRITE_METHODS = new Set(["POST", "PUT", "DELETE", "PATCH"]);
 
@@ -286,6 +288,31 @@ server.tool(
         );
       }
 
+      // Array shrinkage detection: compare body against backup
+      if (backupDataKey && resolvedBody) {
+        const backupEntry = loadResponse(backupDataKey);
+        if (backupEntry) {
+          const shrinkWarnings = detectArrayShrinkage(resolvedBody, backupEntry.data);
+          if (shrinkWarnings.length > 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: "Array shrinkage detected: request body has significantly fewer array items than current state",
+                  warnings: shrinkWarnings,
+                  backupDataKey,
+                  hint: "This often happens when truncated query results are sent back as the full payload. " +
+                    "Use query_api with unlimited: true and the backupDataKey to retrieve the full current data, " +
+                    "then modify the complete array before resubmitting. " +
+                    "If this is intentional, use skipBackup: true to bypass this check.",
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+        }
+      }
+
       const { data, responseHeaders: respHeaders } = await callApi(
         config,
         method,
@@ -317,7 +344,8 @@ server.tool(
       const { schema, shapeHash } = getOrBuildSchema(data, method, path, endpoint?.requestBodySchema, bodyHash);
       const sdl = schemaToSDL(schema);
 
-      const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash, dataKey, responseHeaders: respHeaders };
+      const result: Record<string, unknown> = { graphqlSchema: sdl, shapeHash, responseHeaders: respHeaders };
+      if (dataKey) result.dataKey = dataKey;
       if (bodyHash) result.bodyHash = bodyHash;
       if (backupDataKey) {
         result.backupDataKey = backupDataKey;
@@ -351,14 +379,18 @@ server.tool(
       const fieldCosts = computeFieldCosts(data);
       result.fieldTokenCosts = fieldCosts;
 
+      // Actual array lengths for truncation awareness
+      const arrayLengths = collectArrayLengths(data);
+      if (Object.keys(arrayLengths).length > 0) {
+        result.fieldArrayLengths = arrayLengths;
+      }
+
       // Budget examples
-      const defaultBudget = 4000;
       const allFieldsCost = fieldCosts._total;
       if (Array.isArray(data) && data.length > 0 && fieldCosts._perItem) {
         const perItem = fieldCosts._perItem;
-        const itemsFit = Math.floor(defaultBudget / perItem);
         result.budgetExamples = [
-          `All fields: ~${perItem} tokens/item, ~${itemsFit} items fit in default budget (${defaultBudget})`,
+          `All fields: ~${perItem} tokens/item, ~${allFieldsCost} tokens total`,
         ];
       } else if (typeof data === "object" && data !== null) {
         result.budgetExamples = [
@@ -394,7 +426,7 @@ server.tool(
           "For paginated APIs, pass limit/offset inside params (as query string parameters to the API), " +
           "NOT as top-level tool parameters. " +
           "Use fieldTokenCosts to understand per-field token costs and select fields wisely. " +
-          "query_api's maxTokens parameter controls response size — select fewer fields to fit more items." +
+          "Responses over ~10k tokens require maxTokens (to truncate) or unlimited: true (for full data)." +
           paginationSuffix;
       } else {
         result.hint =
@@ -403,7 +435,7 @@ server.tool(
           "For paginated APIs, pass limit/offset inside params (as query string parameters to the API), " +
           "NOT as top-level tool parameters. " +
           "Use fieldTokenCosts to understand per-field token costs and select fields wisely. " +
-          "query_api's maxTokens parameter controls response size — select fewer fields to fit more items." +
+          "Responses over ~10k tokens require maxTokens (to truncate) or unlimited: true (for full data)." +
           paginationSuffix;
       }
 
@@ -431,8 +463,10 @@ server.tool(
     "- Write operations with mutation schema: 'mutation { post_endpoint(input: { ... }) { id name } }'\n" +
     "Field names with dashes are converted to underscores (e.g. created-at → created_at). " +
     "PAGINATION: To paginate the API itself, pass limit/offset inside 'params' (they become query string parameters). " +
-    "TOKEN BUDGET: Use maxTokens to control response size. If the response exceeds the budget, " +
-    "array results are truncated to fit. Select fewer fields to fit more items. " +
+    "TOKEN BUDGET (three modes):\n" +
+    "1. No maxTokens/unlimited: responses over ~10k tokens return an error — use maxTokens or unlimited to proceed.\n" +
+    "2. maxTokens: truncates the deepest largest array to fit the budget.\n" +
+    "3. unlimited: true: returns the full response with no truncation.\n" +
     "Check _status in the response: 'COMPLETE' means all data returned, 'TRUNCATED' means array was cut to fit budget. " +
     "Every response includes a _dataKey for subsequent re-queries with different field selections.",
   {
@@ -494,8 +528,15 @@ server.tool(
       .min(100)
       .optional()
       .describe(
-        "Token budget for the response (default: 4000). If exceeded, array results are truncated to fit. " +
-          "Select fewer fields to fit more items."
+        "Token budget for the response. If exceeded, the deepest largest array is truncated to fit. " +
+          "Select fewer fields to fit more items. Without this or unlimited, responses over ~10k tokens are rejected."
+      ),
+    unlimited: z
+      .boolean()
+      .optional()
+      .describe(
+        "Set to true to return the full response with no token budget enforcement. " +
+          "Use when you know exactly what fields you need and want all data."
       ),
     skipBackup: z
       .boolean()
@@ -505,9 +546,8 @@ server.tool(
           "Default: false (backup is created automatically)."
       ),
   },
-  async ({ method, path, params, body, bodyFile, query, dataKey, headers, jsonFilter, maxTokens, skipBackup }) => {
+  async ({ method, path, params, body, bodyFile, query, dataKey, headers, jsonFilter, maxTokens, unlimited, skipBackup }) => {
     try {
-      const budget = maxTokens ?? 4000;
 
       // Resolve body from inline or file
       let resolvedBody: Record<string, unknown> | undefined;
@@ -544,9 +584,33 @@ server.tool(
 
       // Try dataKey cache first
       const cached = dataKey ? loadResponse(dataKey) : null;
+      let cachedDataAge: number | undefined;
       if (cached) {
         rawData = cached.data;
         respHeaders = cached.responseHeaders;
+        cachedDataAge = Math.round((Date.now() - cached.storedAt) / 1000);
+
+        // Shrinkage check against cached data for write methods (even on cache hit)
+        if (resolvedBody && (method === "PUT" || method === "PATCH") && !skipBackup) {
+          const shrinkWarnings = detectArrayShrinkage(resolvedBody, cached.data);
+          if (shrinkWarnings.length > 0) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: JSON.stringify({
+                  error: "Array shrinkage detected: request body has significantly fewer array items than cached state",
+                  warnings: shrinkWarnings,
+                  dataKey,
+                  hint: "This often happens when truncated query results are sent back as the full payload. " +
+                    "Use query_api with unlimited: true and this dataKey to retrieve the full current data, " +
+                    "then modify the complete array before resubmitting. " +
+                    "If this is intentional, use skipBackup: true to bypass this check.",
+                }, null, 2),
+              }],
+              isError: true,
+            };
+          }
+        }
       } else {
         // Pre-write backup for PUT/PATCH
         if ((method === "PATCH" || method === "PUT") && !skipBackup) {
@@ -555,6 +619,31 @@ server.tool(
             params as Record<string, unknown> | undefined,
             headers
           );
+        }
+
+        // Array shrinkage detection: compare body against backup
+        if (backupDataKey && resolvedBody) {
+          const backupEntry = loadResponse(backupDataKey);
+          if (backupEntry) {
+            const shrinkWarnings = detectArrayShrinkage(resolvedBody, backupEntry.data);
+            if (shrinkWarnings.length > 0) {
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: JSON.stringify({
+                    error: "Array shrinkage detected: request body has significantly fewer array items than current state",
+                    warnings: shrinkWarnings,
+                    backupDataKey,
+                    hint: "This often happens when truncated query results are sent back as the full payload. " +
+                      "Use query_api with unlimited: true and the backupDataKey to retrieve the full current data, " +
+                      "then modify the complete array before resubmitting. " +
+                      "If this is intentional, use skipBackup: true to bypass this check.",
+                  }, null, 2),
+                }],
+                isError: true,
+              };
+            }
+          }
         }
 
         const result = await callApi(
@@ -579,7 +668,7 @@ server.tool(
             { type: "text" as const, text: JSON.stringify({
               rawResponse: rawData,
               responseHeaders: respHeaders,
-              _dataKey: newDataKey,
+              ...(newDataKey ? { _dataKey: newDataKey } : {}),
               hint: "This endpoint returned a non-JSON response. GraphQL querying is not available. " +
                 "The raw parsed content is shown above.",
             }, null, 2) },
@@ -590,17 +679,51 @@ server.tool(
       const endpoint = apiIndex.getEndpoint(method, path);
       const bodyHash = WRITE_METHODS.has(method) && resolvedBody ? computeShapeHash(resolvedBody) : undefined;
       const { schema, shapeHash, fromCache } = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema, bodyHash);
-      let queryResult = await executeQuery(schema, rawData, query);
+      let queryResult = await executeQuery(schema, rawData, query, unlimited ? { unlimited: true } : undefined);
 
       if (jsonFilter) {
         queryResult = applyJsonFilter(queryResult, jsonFilter);
       }
 
-      // Apply token budget (skip for write operations — mutation responses shouldn't be truncated)
+      // Apply token budget: three-mode dispatch
       const isWrite = WRITE_METHODS.has(method);
-      const { status, result: budgetResult } = isWrite
-        ? { status: "COMPLETE", result: queryResult }
-        : buildStatusMessage(queryResult, budget);
+      let status: string;
+      let budgetResult: unknown;
+
+      if (unlimited || isWrite) {
+        // Unlimited or write → no enforcement
+        const arrayLen = typeof queryResult === "object" && queryResult !== null && !Array.isArray(queryResult)
+          ? findPrimaryArrayLength(queryResult)
+          : null;
+        status = arrayLen !== null ? `COMPLETE (${arrayLen} items)` : "COMPLETE";
+        budgetResult = queryResult;
+      } else if (maxTokens !== undefined) {
+        // Explicit budget → deep truncation
+        ({ status, result: budgetResult } = buildStatusMessage(queryResult, maxTokens));
+      } else {
+        // No budget, no unlimited → enforce 10k safety limit
+        const estimatedTokens = estimateResultTokens(queryResult);
+        if (estimatedTokens > 10000) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({
+                error: `Response too large (~${estimatedTokens} tokens). To proceed, either:\n` +
+                  `1. Use call_api to inspect the schema and select fewer fields\n` +
+                  `2. Set maxTokens (e.g. maxTokens: 4000) to truncate automatically\n` +
+                  `3. Set unlimited: true if you need the full response`,
+                estimatedTokens,
+              }, null, 2),
+            }],
+            isError: true,
+          };
+        }
+        const arrayLen = typeof queryResult === "object" && queryResult !== null && !Array.isArray(queryResult)
+          ? findPrimaryArrayLength(queryResult)
+          : null;
+        status = arrayLen !== null ? `COMPLETE (${arrayLen} items)` : "COMPLETE";
+        budgetResult = queryResult;
+      }
 
       if (typeof budgetResult === "object" && budgetResult !== null && !Array.isArray(budgetResult)) {
         const qr = budgetResult as Record<string, unknown>;
@@ -619,7 +742,9 @@ server.tool(
           qr._pagination = pagination;
         }
         // _status as first key
-        const output: Record<string, unknown> = { _status: status, _dataKey: newDataKey, ...qr };
+        const output: Record<string, unknown> = { _status: status, ...qr };
+        if (newDataKey) output._dataKey = newDataKey;
+        if (cachedDataAge !== undefined) output._dataAge = `${cachedDataAge}s ago (from cache)`;
         if (backupDataKey) {
           output._backupDataKey = backupDataKey;
           output._backupHint = "Pre-write snapshot stored. Use query_api with this dataKey to retrieve original data if needed.";
@@ -631,7 +756,9 @@ server.tool(
         };
       }
 
-      const output: Record<string, unknown> = { _status: status, _dataKey: newDataKey, data: budgetResult };
+      const output: Record<string, unknown> = { _status: status, data: budgetResult };
+      if (newDataKey) output._dataKey = newDataKey;
+      if (cachedDataAge !== undefined) output._dataAge = `${cachedDataAge}s ago (from cache)`;
       if (backupDataKey) {
         output._backupDataKey = backupDataKey;
         output._backupHint = "Pre-write snapshot stored. Use query_api with this dataKey to retrieve original data if needed.";
