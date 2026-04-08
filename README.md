@@ -117,7 +117,8 @@ mutation { post_endpoint(input: { name: "example" }) { id } }
 ```
 
 Key parameters:
-- **`maxTokens`** — token budget for the response (default 4000). Arrays are truncated to fit.
+- **`maxTokens`** — token budget for the response. Arrays are truncated to fit. Without this or `unlimited`, responses over ~10k tokens are rejected.
+- **`unlimited`** — set to `true` to return the full response with no token budget enforcement.
 - **`dataKey`** — reuse cached data from a previous `call_api` or `query_api` response.
 - **`jsonFilter`** — dot-path to extract nested values after the GraphQL query (e.g. `"data[].attributes.name"`).
 - **`bodyFile`** — absolute path to a JSON file to use as request body (mutually exclusive with `body`). Use for large payloads that can't be sent inline.
@@ -182,7 +183,7 @@ OpenAPI/Postman spec
 - **Mutation support** — write operations get typed GraphQL mutations from OpenAPI body schemas
 - **Smart suggestions** — `call_api` returns ready-to-use queries based on the inferred schema
 - **Response caching** — filesystem-based cache with 5-min TTL; `dataKey` tokens let `query_api` reuse data with zero HTTP calls
-- **Token budget** — `query_api` accepts `maxTokens` (default 4000) and truncates array results to fit via binary search
+- **Token budget** — `query_api` enforces a ~10k token safety limit by default; use `maxTokens` to truncate the deepest largest array to fit, or `unlimited: true` for full responses
 - **Per-field token costs** — `call_api` returns a `fieldTokenCosts` tree so the LLM can make informed field selections
 - **Rate limit tracking** — parses `X-RateLimit-*` headers and warns when limits are nearly exhausted
 - **Pagination detection** — auto-detects cursor, next-page-token, and link-based pagination patterns in responses
