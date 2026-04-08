@@ -8,6 +8,7 @@ import {
   computeShapeHash,
   collectJsonFields,
   computeFieldCosts,
+  collectArrayLengths,
 } from "../src/graphql-schema.js";
 import type { FieldCostNode } from "../src/graphql-schema.js";
 
@@ -677,6 +678,62 @@ describe("recursive array pagination", () => {
     expect((result as Record<string, unknown[]>).users).toHaveLength(5);
   });
 
+  it("unlimited context bypasses nested array resolver limits", async () => {
+    const data = {
+      products: Array.from({ length: 100 }, (_, i) => ({
+        id: i,
+        tags: Array.from({ length: 80 }, (_, j) => `tag-${j}`),
+      })),
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/unlimited-nested");
+    const result = await executeQuery(schema, data, "{ products { id tags } }", { unlimited: true });
+    const products = (result as Record<string, unknown[]>).products as Array<{ id: number; tags: string[] }>;
+    expect(products).toHaveLength(100);
+    for (const p of products) {
+      expect(p.tags).toHaveLength(80);
+    }
+  });
+
+  it("unlimited context bypasses top-level array resolver limit", async () => {
+    const data = Array.from({ length: 100 }, (_, i) => ({ id: i }));
+    const schema = buildSchemaFromData(data, "GET", "/test/unlimited-top");
+    const result = await executeQuery(schema, data, "{ items { id } _count }", { unlimited: true });
+    const r = result as { items: Array<{ id: number }>; _count: number };
+    expect(r.items).toHaveLength(100);
+    expect(r._count).toBe(100);
+  });
+
+  it("unlimited context returns all items even for large arrays that would exceed budgets", async () => {
+    // This tests that unlimited bypasses resolver limits completely,
+    // so even with hundreds of items the full array is returned
+    const data = {
+      dashboard: {
+        id: 1,
+        dashcards: Array.from({ length: 200 }, (_, i) => ({
+          id: i, card_id: i * 10, col: 0, row: i * 4,
+        })),
+      },
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/unlimited-large");
+    const result = await executeQuery(
+      schema, data,
+      "{ dashboard { dashcards { id card_id } dashcards_count } }",
+      { unlimited: true }
+    );
+    const dash = (result as Record<string, { dashcards: unknown[]; dashcards_count: number }>).dashboard;
+    expect(dash.dashcards).toHaveLength(200);
+    expect(dash.dashcards_count).toBe(200);
+  });
+
+  it("without unlimited context, resolver limits still apply", async () => {
+    const data = Array.from({ length: 100 }, (_, i) => ({ id: i }));
+    const schema = buildSchemaFromData(data, "GET", "/test/no-unlimited");
+    const result = await executeQuery(schema, data, "{ items { id } _count }");
+    const r = result as { items: Array<{ id: number }>; _count: number };
+    expect(r.items).toHaveLength(50); // default limit MAX_ARRAY_LIMIT
+    expect(r._count).toBe(100);
+  });
+
   it("caps top-level array items with default limit", async () => {
     const data = Array.from({ length: 100 }, (_, i) => ({ id: i }));
     const schema = buildSchemaFromData(data, "GET", "/test/top-array-cap");
@@ -713,7 +770,7 @@ describe("recursive array pagination", () => {
         geo: { country: "US", city: "NYC", lat: 40.7, lng: -74.0 },
       },
     };
-    // ~18 leaf fields → limit should be well below 50
+    // ~18 leaf fields → limit should be well below 50 but at least MIN_ITEMS (10)
     const data = Array.from({ length: 100 }, () => ({ ...complexItem }));
     const schema = buildSchemaFromData(data, "GET", "/test/dynamic-limit");
     const sdl = schemaToSDL(schema);
@@ -721,7 +778,7 @@ describe("recursive array pagination", () => {
     expect(match).not.toBeNull();
     const limit = parseInt(match![1], 10);
     expect(limit).toBeLessThan(50);
-    expect(limit).toBeGreaterThanOrEqual(3);
+    expect(limit).toBeGreaterThanOrEqual(10);
 
     // Verify the limit is actually applied in execution
     const result = await executeQuery(schema, data, "{ items { id } _count }");
@@ -749,9 +806,9 @@ describe("recursive array pagination", () => {
     const match = sdl.match(/tags\(limit: Int = (\d+)/);
     expect(match).not.toBeNull();
     const limit = parseInt(match![1], 10);
-    // Long strings (~65 chars each ≈ 19 tokens) should get a much lower limit than 50
-    expect(limit).toBeLessThan(15);
-    expect(limit).toBeGreaterThanOrEqual(3);
+    // Long strings (~65 chars each ≈ 19 tokens) — MIN_ITEMS floors at 10
+    expect(limit).toBeLessThanOrEqual(50);
+    expect(limit).toBeGreaterThanOrEqual(10);
 
     // Verify the limit is enforced
     const result = await executeQuery(schema, data, "{ tags }") as { tags: string[] };
@@ -991,5 +1048,99 @@ describe("computeFieldCosts", () => {
     const costs = computeFieldCosts(data);
     expect(costs.my_field).toBeDefined();
     expect(costs.another_field).toBeDefined();
+  });
+});
+
+describe("nested array _count sibling fields", () => {
+  it("shows full array length via _count while array is truncated", async () => {
+    const data = {
+      dashboard: {
+        id: 1,
+        dashcards: Array.from({ length: 60 }, (_, i) => ({
+          id: i,
+          card_id: i * 10,
+          col: 0,
+          row: i * 4,
+        })),
+      },
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/count-sibling");
+    const sdl = schemaToSDL(schema);
+    expect(sdl).toContain("dashcards_count: Int");
+
+    const result = await executeQuery(
+      schema, data,
+      "{ dashboard { dashcards { id } dashcards_count } }"
+    );
+    const dash = (result as Record<string, { dashcards: unknown[]; dashcards_count: number }>).dashboard;
+    expect(dash.dashcards_count).toBe(60);
+    expect(dash.dashcards.length).toBeLessThan(60);
+  });
+
+  it("does not add _count when name collides with existing field", async () => {
+    const data = {
+      tags: ["a", "b", "c"],
+      tags_count: 42,
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/count-collision");
+    const result = await executeQuery(schema, data, "{ tags tags_count }");
+    const r = result as { tags: string[]; tags_count: number };
+    // tags_count should resolve to the original value (42), not array length (3)
+    expect(r.tags_count).toBe(42);
+  });
+
+  it("adds _count for top-level object array fields", async () => {
+    const data = {
+      products: Array.from({ length: 80 }, (_, i) => ({ id: i, name: `p${i}` })),
+    };
+    const schema = buildSchemaFromData(data, "GET", "/test/count-toplevel");
+    const result = await executeQuery(schema, data, "{ products { id } products_count }");
+    const r = result as { products: unknown[]; products_count: number };
+    expect(r.products_count).toBe(80);
+    expect(r.products.length).toBeLessThan(80);
+  });
+});
+
+describe("collectArrayLengths", () => {
+  it("collects top-level array field lengths", () => {
+    const data = { items: [1, 2, 3], tags: ["a", "b"] };
+    const result = collectArrayLengths(data);
+    expect(result).toEqual({ items: 3, tags: 2 });
+  });
+
+  it("collects nested array field lengths", () => {
+    const data = {
+      dashboard: { dashcards: Array(30).fill({ id: 1 }), parameters: Array(5).fill("x") },
+    };
+    const result = collectArrayLengths(data);
+    expect(result["dashboard.dashcards"]).toBe(30);
+    expect(result["dashboard.parameters"]).toBe(5);
+  });
+
+  it("returns empty for top-level array (call_api uses totalItems instead)", () => {
+    const data = [{ id: 1 }, { id: 2 }];
+    const result = collectArrayLengths(data);
+    expect(Object.keys(result)).toHaveLength(0);
+  });
+
+  it("sanitizes field names with dashes", () => {
+    const data = { "my-tags": ["a", "b", "c"] };
+    const result = collectArrayLengths(data);
+    expect(result["my_tags"]).toBe(3);
+  });
+
+  it("returns empty for scalar data", () => {
+    expect(collectArrayLengths("hello")).toEqual({});
+    expect(collectArrayLengths(42)).toEqual({});
+    expect(collectArrayLengths(null)).toEqual({});
+  });
+
+  it("finds nested arrays inside array elements", () => {
+    const data = {
+      users: [{ id: 1, roles: ["admin", "user"] }],
+    };
+    const result = collectArrayLengths(data);
+    expect(result["users"]).toBe(1);
+    expect(result["users.roles"]).toBe(2);
   });
 });

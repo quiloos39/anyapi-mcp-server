@@ -30,6 +30,11 @@ const MAX_ARRAY_LIMIT = 50;
 const MAX_SAMPLE_SIZE = 50;
 const MAJORITY_THRESHOLD = 0.6;
 
+/** Context passed through GraphQL execution to control resolver behavior. */
+export interface QueryContext {
+  unlimited?: boolean;
+}
+
 /**
  * Validation rules that skip FieldsOnCorrectTypeRule and ScalarLeafsRule.
  * This allows queries to select subfields on empty arrays (inferred as [JSON])
@@ -195,8 +200,8 @@ function dynamicArrayLimit(arr: unknown[]): number {
     costPerItem = totalCost / sampleCount;
   }
 
-  const TOKEN_BUDGET = 200;
-  const MIN_ITEMS = 3;
+  const TOKEN_BUDGET = 500;
+  const MIN_ITEMS = 10;
   return Math.max(MIN_ITEMS, Math.min(MAX_ARRAY_LIMIT, Math.floor(TOKEN_BUDGET / costPerItem)));
 }
 const MAX_INFER_DEPTH = 8;
@@ -518,6 +523,8 @@ function inferType(
     typeRegistry.set(typeName, placeholder);
 
     const usedNames = new Set<string>();
+    // Pre-compute all sanitized names to detect collisions with synthetic _count fields
+    const allSanitizedNames = new Set(entries.map(([k]) => sanitizeFieldName(k)));
     const fieldConfigs: GraphQLFieldConfigMap<
       Record<string, unknown>,
       unknown
@@ -563,13 +570,28 @@ function inferType(
           },
           resolve: (
             source: Record<string, unknown>,
-            args: { limit: number; offset: number }
+            args: { limit: number; offset: number },
+            ctx: unknown
           ) => {
             const val = source[key];
             if (!Array.isArray(val)) return val;
+            if ((ctx as QueryContext | undefined)?.unlimited) return val;
             return val.slice(args.offset, args.offset + args.limit);
           },
         };
+        // Add _count sibling so truncation is visible (skip if source data already has this field name)
+        const countFieldName = `${sanitized}_count`;
+        if (!allSanitizedNames.has(countFieldName)) {
+          usedNames.add(countFieldName);
+          fieldConfigs[countFieldName] = {
+            type: GraphQLInt,
+            description: `Total count of ${sanitized} (before any limit/offset truncation)`,
+            resolve: (source: Record<string, unknown>) => {
+              const val = source[key];
+              return Array.isArray(val) ? val.length : null;
+            },
+          };
+        }
       } else {
         fieldConfigs[sanitized] = {
           type: fieldType,
@@ -725,10 +747,12 @@ export function buildSchemaFromData(
           },
           resolve: (
             source: unknown,
-            args: { limit: number; offset: number }
+            args: { limit: number; offset: number },
+            ctx: unknown
           ) => {
             const arr = source as unknown[];
             if (!Array.isArray(arr)) return arr;
+            if ((ctx as QueryContext | undefined)?.unlimited) return arr;
             return arr.slice(args.offset, args.offset + args.limit);
           },
         },
@@ -893,6 +917,47 @@ export function collectJsonFields(schema: GraphQLSchema): string[] {
 }
 
 /**
+ * Walk response data and collect actual array lengths for each array field.
+ * Returns a map of sanitized dotted paths to their lengths.
+ * Used by call_api to give the AI visibility into true array sizes.
+ */
+export function collectArrayLengths(
+  data: unknown,
+  depth: number = 0,
+  prefix: string = ""
+): Record<string, number> {
+  if (depth >= MAX_INFER_DEPTH || data === null || data === undefined) return {};
+  const result: Record<string, number> = {};
+
+  if (Array.isArray(data)) {
+    if (prefix) result[prefix] = data.length;
+    // Recurse into first element to discover nested arrays
+    if (data.length > 0 && typeof data[0] === "object" && data[0] !== null && !Array.isArray(data[0])) {
+      Object.assign(result, collectArrayLengths(data[0], depth + 1, prefix));
+    }
+    return result;
+  }
+
+  if (typeof data === "object") {
+    for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
+      const sanitized = sanitizeFieldName(key);
+      const path = prefix ? `${prefix}.${sanitized}` : sanitized;
+      if (Array.isArray(value)) {
+        result[path] = value.length;
+        // Recurse into first element for nested arrays
+        if (value.length > 0 && typeof value[0] === "object" && value[0] !== null && !Array.isArray(value[0])) {
+          Object.assign(result, collectArrayLengths(value[0], depth + 1, path));
+        }
+      } else if (typeof value === "object" && value !== null) {
+        Object.assign(result, collectArrayLengths(value, depth + 1, path));
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Execute a GraphQL selection query against JSON data using a schema.
  * The query should be a selection set like `{ id name collection { id } }`.
  * Also supports mutation syntax: `mutation { ... }`.
@@ -900,7 +965,8 @@ export function collectJsonFields(schema: GraphQLSchema): string[] {
 export async function executeQuery(
   schema: GraphQLSchema,
   data: unknown,
-  query: string
+  query: string,
+  context?: QueryContext
 ): Promise<unknown> {
   const trimmed = query.trim();
   const fullQuery =
@@ -916,7 +982,7 @@ export async function executeQuery(
     throw new Error(`GraphQL query error: ${messages}`);
   }
 
-  const result = await execute({ schema, document, rootValue: data });
+  const result = await execute({ schema, document, rootValue: data, contextValue: context });
 
   if (result.errors && result.errors.length > 0) {
     const messages = result.errors.map((e) => e.message).join("; ");
