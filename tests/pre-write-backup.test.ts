@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createBackup } from "../src/pre-write-backup.js";
+import { createBackup, extractPathParamNames } from "../src/pre-write-backup.js";
 import { _setResponseDirForTests, _clearAllForTests, loadResponse } from "../src/data-cache.js";
 
 // Mock api-client
@@ -88,5 +88,82 @@ describe("createBackup", () => {
     expect(await createBackup(baseConfig, "POST", "/items")).toBeUndefined();
     expect(await createBackup(baseConfig, "DELETE", "/items/{id}")).toBeUndefined();
     expect(mockCallApi).not.toHaveBeenCalled();
+  });
+
+  it("strips query params and only forwards path params to GET", async () => {
+    mockCallApi.mockResolvedValue({
+      data: { id: 123, items: Array(30).fill({ id: 1 }) },
+      responseHeaders: {},
+    });
+
+    await createBackup(
+      baseConfig, "PATCH", "/templates/{id}",
+      { id: "123", limit: 10, filter: "active" }
+    );
+
+    expect(mockCallApi).toHaveBeenCalledWith(
+      baseConfig,
+      "GET",
+      "/templates/{id}",
+      { id: "123" },
+      undefined,
+      undefined
+    );
+  });
+
+  it("strips all params when path has no path params", async () => {
+    mockCallApi.mockResolvedValue({
+      data: { items: [] },
+      responseHeaders: {},
+    });
+
+    await createBackup(
+      baseConfig, "PUT", "/settings",
+      { format: "json", verbose: "true" }
+    );
+
+    expect(mockCallApi).toHaveBeenCalledWith(
+      baseConfig,
+      "GET",
+      "/settings",
+      undefined,
+      undefined,
+      undefined
+    );
+  });
+
+  it("handles multiple path params correctly", async () => {
+    mockCallApi.mockResolvedValue({
+      data: { ok: true },
+      responseHeaders: {},
+    });
+
+    await createBackup(
+      baseConfig, "PUT", "/orgs/{orgId}/repos/{repoId}",
+      { orgId: "acme", repoId: "42", page: 1, per_page: 50 }
+    );
+
+    expect(mockCallApi).toHaveBeenCalledWith(
+      baseConfig,
+      "GET",
+      "/orgs/{orgId}/repos/{repoId}",
+      { orgId: "acme", repoId: "42" },
+      undefined,
+      undefined
+    );
+  });
+});
+
+describe("extractPathParamNames", () => {
+  it("extracts single param", () => {
+    expect(extractPathParamNames("/items/{id}")).toEqual(new Set(["id"]));
+  });
+
+  it("extracts multiple params", () => {
+    expect(extractPathParamNames("/orgs/{orgId}/repos/{repoId}")).toEqual(new Set(["orgId", "repoId"]));
+  });
+
+  it("returns empty set for no params", () => {
+    expect(extractPathParamNames("/settings")).toEqual(new Set());
   });
 });
