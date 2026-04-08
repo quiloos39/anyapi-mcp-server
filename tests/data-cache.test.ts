@@ -69,6 +69,34 @@ describe("loadResponse", () => {
   });
 });
 
+describe("storeResponse error handling", () => {
+  it("returns undefined when write fails", () => {
+    _setResponseDirForTests("/nonexistent/deeply/nested/path/that/cannot/exist");
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    const key = storeResponse("GET", "/test", { ok: true }, {});
+    expect(key).toBeUndefined();
+    expect(stderrSpy).toHaveBeenCalledWith(
+      expect.stringContaining("data-cache: failed to store")
+    );
+
+    stderrSpy.mockRestore();
+    _setResponseDirForTests(tempDir);
+  });
+});
+
+describe("storedAt tracking", () => {
+  it("returns storedAt timestamp from loadResponse", () => {
+    const before = Date.now();
+    const key = storeResponse("GET", "/users", [{ id: 1 }], {});
+    const after = Date.now();
+    const loaded = loadResponse(key!);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.storedAt).toBeGreaterThanOrEqual(before);
+    expect(loaded!.storedAt).toBeLessThanOrEqual(after);
+  });
+});
+
 describe("cleanupExpired", () => {
   it("removes only expired files", () => {
     vi.useFakeTimers();

@@ -10,6 +10,7 @@ interface CachedResponse {
   path: string;
   data: unknown;
   responseHeaders: Record<string, string>;
+  storedAt: number;
   expiresAt: number;
 }
 
@@ -66,14 +67,16 @@ export function storeResponse(
   path: string,
   data: unknown,
   responseHeaders: Record<string, string>
-): string {
+): string | undefined {
   const dataKey = randomBytes(4).toString("hex");
+  const now = Date.now();
   const entry: CachedResponse = {
     method,
     path,
     data,
     responseHeaders,
-    expiresAt: Date.now() + TTL_MS,
+    storedAt: now,
+    expiresAt: now + TTL_MS,
   };
   try {
     ensureDir();
@@ -81,13 +84,14 @@ export function storeResponse(
     cleanupExpired();
   } catch (err) {
     process.stderr.write(`data-cache: failed to store ${dataKey}: ${err}\n`);
+    return undefined;
   }
   return dataKey;
 }
 
 export function loadResponse(
   dataKey: string
-): { method: string; path: string; data: unknown; responseHeaders: Record<string, string> } | null {
+): { method: string; path: string; data: unknown; responseHeaders: Record<string, string>; storedAt: number } | null {
   try {
     const filePath = join(responseDir, `${dataKey}.json`);
     const content = readFileSync(filePath, "utf-8");
@@ -101,6 +105,7 @@ export function loadResponse(
       path: entry.path,
       data: entry.data,
       responseHeaders: entry.responseHeaders,
+      storedAt: entry.storedAt ?? (entry.expiresAt - TTL_MS),
     };
   } catch {
     return null;
