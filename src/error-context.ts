@@ -143,7 +143,7 @@ function getSuggestion(status: number, endpoint?: ApiEndpoint): string {
       if (status >= 500) {
         return "Server error. This is likely a temporary issue with the API. Try again later.";
       }
-      return "Check the API documentation for this endpoint using explain_api.";
+      return "Check the API documentation for this endpoint using inspect_api.";
   }
 }
 

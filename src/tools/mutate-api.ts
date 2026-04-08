@@ -1,7 +1,6 @@
 import { z } from "zod";
 import type { ToolContext } from "./shared.js";
 import {
-  WRITE_METHODS,
   formatToolError,
   attachRateLimit,
   shrinkageError,
@@ -165,7 +164,7 @@ export function registerMutateApi({ server, config, apiIndex }: ToolContext): vo
           headers
         );
 
-        return buildMutateResponse(
+        return await buildMutateResponse(
           { apiIndex },
           method, path, rawData, respHeaders, resolvedBody,
           query, backupDataKey
@@ -272,7 +271,7 @@ async function handlePatchMode(
     headers
   );
 
-  return buildMutateResponse(
+  return await buildMutateResponse(
     { apiIndex },
     method, path, rawData, respHeaders, patchedBody,
     query, backupDataKey, operations.length
@@ -282,7 +281,7 @@ async function handlePatchMode(
 /**
  * Build the response for mutate_api (shared between direct and patch modes).
  */
-function buildMutateResponse(
+async function buildMutateResponse(
   { apiIndex }: Pick<ToolContext, "apiIndex">,
   method: string,
   path: string,
@@ -314,51 +313,19 @@ function buildMutateResponse(
   const { schema, fromCache } = getOrBuildSchema(rawData, method, path, endpoint?.requestBodySchema, bodyHash);
 
   // If query provided, apply GraphQL field selection
-  let responseData: unknown = rawData;
-  let schemaIncluded = false;
-
+  let resultData: unknown = rawData;
   if (query) {
-    // executeQuery is async
-    const executePromise = executeQuery(schema, rawData, query);
-    // We need to handle this synchronously in the return, so we'll use a wrapper
-    return (async () => {
-      const queryResult = await executePromise;
-
-      const output: Record<string, unknown> = { _status: "COMPLETE" };
-
-      if (typeof queryResult === "object" && queryResult !== null && !Array.isArray(queryResult)) {
-        Object.assign(output, queryResult);
-      } else {
-        output.data = queryResult;
-      }
-
-      attachRateLimit(output, respHeaders);
-      if (!fromCache) {
-        output._schema = schemaToSDL(schema);
-        const suggestions = generateSuggestions(schema);
-        if (suggestions.length > 0) {
-          output._suggestedQueries = suggestions;
-        }
-      }
-      if (newDataKey) output._dataKey = newDataKey;
-      if (backupDataKey) {
-        output._backupDataKey = backupDataKey;
-        output._backupHint = "Pre-write snapshot stored. Use query_api with this dataKey to retrieve original data if needed.";
-      }
-      if (patchCount !== undefined) {
-        output._patchApplied = `${patchCount} operation(s) applied successfully`;
-      }
-
-      return {
-        content: [
-          { type: "text" as const, text: JSON.stringify(output, null, 2) },
-        ],
-      };
-    })();
+    resultData = await executeQuery(schema, rawData, query);
   }
 
-  // No query — return raw response with metadata
-  const output: Record<string, unknown> = { _status: "COMPLETE", data: responseData };
+  const output: Record<string, unknown> = { _status: "COMPLETE" };
+
+  if (query && typeof resultData === "object" && resultData !== null && !Array.isArray(resultData)) {
+    Object.assign(output, resultData);
+  } else {
+    output.data = resultData;
+  }
+
   attachRateLimit(output, respHeaders);
   if (!fromCache) {
     output._schema = schemaToSDL(schema);

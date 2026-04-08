@@ -227,6 +227,6 @@ describe("buildErrorContext", () => {
   it("generates generic suggestion for unknown status", () => {
     const err = new ApiError("API error 418", 418, "I'm a Teapot", "");
     const ctx = buildErrorContext(err, "GET", "/brew");
-    expect(ctx.suggestion).toContain("explain_api");
+    expect(ctx.suggestion).toContain("inspect_api");
   });
 });

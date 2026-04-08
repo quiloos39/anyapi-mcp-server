@@ -39,7 +39,7 @@ function walkPath(data: unknown, path: string[]): unknown {
 }
 
 /**
- * Known pagination-related query parameter names (used to flag params in call_api).
+ * Known pagination-related query parameter names (used to flag params in inspect_api).
  */
 export const PAGINATION_PARAM_NAMES = new Set([
   "page", "cursor", "after", "before", "limit", "offset", "per_page",

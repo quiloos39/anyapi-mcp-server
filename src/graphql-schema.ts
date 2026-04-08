@@ -82,7 +82,7 @@ function estimateTokenCost(value: unknown, depth: number = 0): number {
 }
 
 /**
- * Per-field token cost tree. Used by call_api to help LLMs understand
+ * Per-field token cost tree. Used by inspect_api to help LLMs understand
  * how much budget each field consumes.
  */
 export interface FieldCostNode {
@@ -919,7 +919,7 @@ export function collectJsonFields(schema: GraphQLSchema): string[] {
 /**
  * Walk response data and collect actual array lengths for each array field.
  * Returns a map of sanitized dotted paths to their lengths.
- * Used by call_api to give the AI visibility into true array sizes.
+ * Used by inspect_api to give the AI visibility into true array sizes.
  */
 export function collectArrayLengths(
   data: unknown,
