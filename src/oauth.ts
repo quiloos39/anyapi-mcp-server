@@ -92,10 +92,6 @@ export function getTokens(): OAuthTokens | null {
   return currentTokens;
 }
 
-export function clearTokens(): void {
-  currentTokens = null;
-}
-
 export function isTokenExpired(): boolean {
   if (!currentTokens) return true;
   return Date.now() >= currentTokens.expiresAt - EXPIRY_BUFFER_MS;

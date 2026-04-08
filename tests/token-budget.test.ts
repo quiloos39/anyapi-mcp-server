@@ -1,40 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
-  findPrimaryArray,
   findPrimaryArrayLength,
-  truncateToTokenBudget,
   buildStatusMessage,
   findDeepestLargestArray,
   truncateDeepArray,
   estimateResultTokens,
 } from "../src/token-budget.js";
-
-describe("findPrimaryArray", () => {
-  it("finds items array first", () => {
-    const obj = { items: [1, 2, 3], other: [4, 5] };
-    expect(findPrimaryArray(obj)).toEqual([1, 2, 3]);
-  });
-
-  it("falls back to first non-_ array field", () => {
-    const obj = { _count: 5, products: [{ id: 1 }], tags: ["a"] };
-    expect(findPrimaryArray(obj)).toEqual([{ id: 1 }]);
-  });
-
-  it("returns null when no arrays", () => {
-    expect(findPrimaryArray({ id: 1, name: "test" })).toBeNull();
-  });
-
-  it("returns null for non-objects", () => {
-    expect(findPrimaryArray(null)).toBeNull();
-    expect(findPrimaryArray([1, 2])).toBeNull();
-    expect(findPrimaryArray("string")).toBeNull();
-  });
-
-  it("skips _-prefixed array fields when items not present", () => {
-    const obj = { _internal: [1, 2], data: [3, 4] };
-    expect(findPrimaryArray(obj)).toEqual([3, 4]);
-  });
-});
 
 describe("findPrimaryArrayLength", () => {
   it("returns length of primary array", () => {
@@ -43,45 +14,6 @@ describe("findPrimaryArrayLength", () => {
 
   it("returns null when no arrays", () => {
     expect(findPrimaryArrayLength({ id: 1 })).toBeNull();
-  });
-});
-
-describe("truncateToTokenBudget", () => {
-  it("truncates large array to fit budget", () => {
-    const items = Array.from({ length: 100 }, (_, i) => ({
-      id: i,
-      name: `item-${i}`,
-      description: `A somewhat long description for item number ${i} that adds tokens`,
-    }));
-    const obj = { items, _count: 100 };
-    const { result, originalCount, keptCount } = truncateToTokenBudget(obj, 500);
-    expect(keptCount).toBeLessThan(originalCount);
-    expect(keptCount).toBeGreaterThanOrEqual(1);
-    expect(originalCount).toBe(100);
-    expect((result.items as unknown[]).length).toBe(keptCount);
-  });
-
-  it("keeps at least 1 item even with tiny budget", () => {
-    const items = [{ id: 1, name: "test", data: "x".repeat(1000) }];
-    const obj = { items };
-    const { keptCount } = truncateToTokenBudget(obj, 10);
-    expect(keptCount).toBe(1);
-  });
-
-  it("returns as-is when no array found", () => {
-    const obj = { id: 1, name: "test" };
-    const { result, originalCount, keptCount } = truncateToTokenBudget(obj, 100);
-    expect(result).toEqual(obj);
-    expect(originalCount).toBe(0);
-    expect(keptCount).toBe(0);
-  });
-
-  it("returns as-is when array fits within budget", () => {
-    const obj = { items: [{ id: 1 }, { id: 2 }] };
-    const { result, originalCount, keptCount } = truncateToTokenBudget(obj, 10000);
-    expect(keptCount).toBe(2);
-    expect(originalCount).toBe(2);
-    expect(result).toEqual(obj);
   });
 });
 

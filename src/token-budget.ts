@@ -9,7 +9,7 @@
  * Checks `items` first (raw array responses), then falls back to
  * the first non-`_`-prefixed array field.
  */
-export function findPrimaryArray(obj: unknown): unknown[] | null {
+function findPrimaryArray(obj: unknown): unknown[] | null {
   if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
   const rec = obj as Record<string, unknown>;
 
@@ -169,79 +169,6 @@ function cloneSpine(
     ...obj,
     [head]: cloneSpine(obj[head] as Record<string, unknown>, rest, leafValue),
   };
-}
-
-/**
- * Truncate the primary array in an object to fit within a token budget.
- * Uses binary search to find the max number of items that fit.
- * Returns the truncated object and the original/truncated counts.
- */
-export function truncateToTokenBudget(
-  obj: Record<string, unknown>,
-  budget: number
-): { result: Record<string, unknown>; originalCount: number; keptCount: number } {
-  const arr = findPrimaryArray(obj);
-  if (!arr || arr.length === 0) {
-    return { result: obj, originalCount: 0, keptCount: 0 };
-  }
-
-  const originalCount = arr.length;
-
-  // Compute overhead tokens (non-array fields)
-  const overhead: Record<string, unknown> = {};
-  const arrayKey = findPrimaryArrayKey(obj);
-  if (!arrayKey) return { result: obj, originalCount, keptCount: originalCount };
-
-  for (const [key, value] of Object.entries(obj)) {
-    if (key !== arrayKey) {
-      overhead[key] = value;
-    }
-  }
-  const overheadTokens = estimateTokens(overhead);
-  const arrayBudget = Math.max(1, budget - overheadTokens);
-
-  // Check if full array fits
-  const fullTokens = estimateTokens(arr);
-  if (fullTokens <= arrayBudget) {
-    return { result: obj, originalCount, keptCount: originalCount };
-  }
-
-  // Binary search for max items that fit
-  let lo = 1;
-  let hi = originalCount;
-  let bestCount = 1; // Always keep at least 1
-
-  while (lo <= hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    const sliceTokens = estimateTokens(arr.slice(0, mid));
-    if (sliceTokens <= arrayBudget) {
-      bestCount = mid;
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
-    }
-  }
-
-  const truncated = { ...obj, [arrayKey]: arr.slice(0, bestCount) };
-  return { result: truncated, originalCount, keptCount: bestCount };
-}
-
-/**
- * Find the key name of the primary array in an object.
- */
-function findPrimaryArrayKey(obj: unknown): string | null {
-  if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
-  const rec = obj as Record<string, unknown>;
-
-  if (Array.isArray(rec.items)) return "items";
-
-  for (const [key, value] of Object.entries(rec)) {
-    if (!key.startsWith("_") && Array.isArray(value)) {
-      return key;
-    }
-  }
-
-  return null;
 }
 
 /**
