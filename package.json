@@ -7,7 +7,7 @@
   "homepage": "https://github.com/quiloos39/anyapi-mcp-server#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/quiloos39/anyapi-mcp-server.git"
+    "url": "git+https://github.com/quiloos39/anyapi-mcp-server.git"
   },
   "keywords": [
     "mcp",
@@ -21,7 +21,7 @@
     "llm"
   ],
   "bin": {
-    "anyapi-mcp": "./build/index.js"
+    "anyapi-mcp": "build/index.js"
   },
   "files": [
     "build",
